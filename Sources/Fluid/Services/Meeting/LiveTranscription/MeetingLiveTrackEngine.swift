@@ -12,6 +12,7 @@ nonisolated protocol MeetingLiveRecognizer: Sendable {
     func prepareModels() async throws
     func appendAudio(_ buffer: AVAudioPCMBuffer) async throws
     func processBufferedAudio() async throws
+    func finish() async throws -> String
     func reset() async
     func setEouCallback(_ callback: @escaping @Sendable (String) -> Void) async
     func setPartialTranscriptCallback(_ callback: @escaping @Sendable (String) -> Void) async
@@ -60,12 +61,17 @@ actor MeetingLiveTrackEngine {
     /// A 24-slot queue held only ~0.25s and shed 5s of meeting-opening audio during warmup.
     nonisolated let queue = MeetingLiveBoundedQueue<MeetingLiveSampleCopy.Sample>(capacity: 512)
     private static let chunkSize: StreamingChunkSize = .ms160
-    private static let maxOpenUtteranceSeconds: Double = 20
-    private static let partialStallSeconds: Double = 2.5
+    private static let partialStallSeconds: Double = 120
     /// The recognizer buffers a full chunk before it can decode it, so the speech behind the first
     /// token started at least one chunk before the audio we were feeding when that token arrived.
     private static let decoderLookback = CMTime(value: CMTimeValue(chunkSize.durationMs), timescale: 1000)
     private let manager: any MeetingLiveRecognizer
+    private enum RecognizerCallback: Sendable {
+        case partial(String)
+        case end(String)
+    }
+
+    private let recognizerCallbacks = MeetingLiveBoundedQueue<RecognizerCallback>(capacity: 64)
     private let uptime: @Sendable () -> Double
     private let diagnosticsEnabled: Bool
     private var diagnosticSnapshot = MeetingLiveDiagnosticSnapshot()
@@ -100,7 +106,6 @@ actor MeetingLiveTrackEngine {
     private var diagUtterances = 0
     private var diagLastFlowLog: Double = 0
     private var diagLastEouUptime: Double?
-
     private var diagLabel: String { self.kind == .microphone ? "MIC" : "APP" }
 
     private func diag(_ message: @autoclosure () -> String) {
@@ -198,11 +203,32 @@ actor MeetingLiveTrackEngine {
     }
 
     private func installCallbacks() async {
-        await self.manager.setEouCallback { [weak self] transcript in
-            Task { await self?.handleEOU(transcript) }
+        let callbacks = self.recognizerCallbacks
+        await self.manager.setEouCallback { transcript in
+            callbacks.enqueue(.end(transcript))
         }
-        await self.manager.setPartialTranscriptCallback { [weak self] transcript in
-            Task { await self?.handlePartial(transcript) }
+        await self.manager.setPartialTranscriptCallback { transcript in
+            callbacks.enqueue(.partial(transcript))
+        }
+    }
+
+    /// Model callbacks can arrive while inference is suspended. Apply them only after the
+    /// decode call returns, so an endpoint cannot reset the decoder during that same inference.
+    private func applyRecognizerCallbacks() async {
+        let dropped = self.recognizerCallbacks.takeDroppedCount()
+        if dropped > 0 {
+            await self.resetUtterance()
+            self.onDegraded?(self.kind, "Live captions missed model updates and resynced.")
+            return
+        }
+        for callback in self.recognizerCallbacks.drainAll() {
+            guard !self.isStopped else { return }
+            switch callback {
+            case let .partial(text): self.handlePartial(text)
+            case let .end(text):
+                await self.handleEOU(text)
+                return
+            }
         }
     }
 
@@ -272,7 +298,6 @@ actor MeetingLiveTrackEngine {
             self.diagnosticSnapshot.convertedBuffers += 1
             self.diagnosticSnapshot.feedSeconds += sample.duration.seconds
         }
-        self.logFlowIfDue()
         do {
             if self.diagnosticsEnabled { self.diagnosticSnapshot.appendStarts += 1 }
             try await self.manager.appendAudio(converted)
@@ -282,6 +307,8 @@ actor MeetingLiveTrackEngine {
             }
             let processStarted = self.diagnosticsEnabled ? self.uptime() : 0
             try await self.manager.processBufferedAudio()
+            await self.applyRecognizerCallbacks()
+            self.logFlowIfDue()
             if self.diagnosticsEnabled {
                 self.diagnosticSnapshot.processCompletions += 1
                 self.diagnosticSnapshot.maxProcessSeconds = max(
@@ -297,22 +324,22 @@ actor MeetingLiveTrackEngine {
         }
     }
 
-    /// The decoder's own endpointing is unreliable in the field: it can stop emitting partials
-    /// mid-utterance (observed after as little as 10s / ~120 chars) and never fire EOU, freezing
-    /// captions on stale text. Two fallbacks close the turn: the decoder has gone quiet for a few
-    /// seconds (a pause or a stall — either way the turn is over), or the utterance hit the hard
-    /// duration ceiling. Both finalize the current partial and reset for a fresh turn.
+    /// A gap in text is not proof the model is stuck. Let the model finish phrases naturally;
+    /// recover only after two minutes without a partial, never merely because a phrase is long.
     private func rotateLongUtteranceIfNeeded() async {
         guard let start = self.utteranceStartPTS,
               let end = self.lastConsumedPTS,
               let turnID = self.utteranceTurnID
         else { return }
-        let openSeconds = end.seconds - start.seconds
         let quietSeconds = self.lastPartialUptime.map { self.uptime() - $0 }
-        let hitCeiling = openSeconds > Self.maxOpenUtteranceSeconds
-        let decoderQuiet = (quietSeconds ?? 0) > Self.partialStallSeconds && !self.lastPartialText.isEmpty
-        guard hitCeiling || decoderQuiet else { return }
-        let text = self.lastPartialText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard (quietSeconds ?? 0) >= Self.partialStallSeconds, !self.lastPartialText.isEmpty else { return }
+        var text = self.lastPartialText.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            let finished = try await self.manager.finish().trimmingCharacters(in: .whitespacesAndNewlines)
+            if !finished.isEmpty { text = finished }
+        } catch {
+            self.onDegraded?(self.kind, "Live captions could not finish a phrase and resynced.")
+        }
         self.utteranceStartPTS = nil
         self.utteranceTurnID = nil
         self.lastPartialText = ""
@@ -323,7 +350,7 @@ actor MeetingLiveTrackEngine {
         self.diagUtterances += 1
         self.diag(String(
             format: "forced EOU (%@) span=[%.2f–%.2f] chars=%d",
-            hitCeiling ? "open>\(Int(Self.maxOpenUtteranceSeconds))s" : String(format: "quiet %.1fs", quietSeconds ?? 0),
+            String(format: "quiet %.1fs", quietSeconds ?? 0),
             start.seconds,
             end.seconds,
             text.count
@@ -461,6 +488,7 @@ actor MeetingLiveTrackEngine {
             self.diagnosticResetUptime = nil
         }
         await self.manager.reset()
+        _ = self.recognizerCallbacks.drainAll()
         if self.diagnosticsEnabled {
             self.diagnosticSnapshot.recognizerResetReturned += 1
             self.diagnosticResetUptime = self.uptime()
@@ -471,6 +499,7 @@ actor MeetingLiveTrackEngine {
     /// Deterministic P0 seam: bypasses capture/model loading, but exercises production conversion,
     /// append/process and existing rotation policy. It deliberately does not add recovery policy.
     func diagnosticConsume(_ sample: MeetingLiveSampleCopy.Sample) async { await self.consume(sample) }
+    func diagnosticInstallCallbacks() async { await self.installCallbacks() }
     func diagnosticPartial(_ text: String) { self.handlePartial(text) }
     func diagnosticSnapshotValue() -> MeetingLiveDiagnosticSnapshot { self.diagnosticSnapshot }
     #endif
