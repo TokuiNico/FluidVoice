@@ -511,6 +511,57 @@ final class MeetingAEC3Tests: XCTestCase {
         XCTAssertThrowsError(try processor.process(render: [.nan] + [Float](repeating: 0, count: 479), capture: capture))
     }
 
+    func testQuietVoiceSurvivesLoudEchoWithoutCountingEchoAsSpeech() throws {
+        let rate = 48_000
+        let frames = 1200
+        let count = frames * 480
+        let echoDelay = 2346
+        var render = [Float](repeating: 0, count: count)
+        var voice = render
+        var capture = render
+        var output = render
+        var renderSeed: UInt32 = 0x12345678
+        var voiceSeed: UInt32 = 0x87654321
+        var filteredRender: Float = 0
+        var filteredVoice: Float = 0
+        for index in 0..<count {
+            renderSeed = renderSeed &* 1_664_525 &+ 1_013_904_223
+            let noise = Float(Int32(bitPattern: renderSeed)) / 2_147_483_648 * 0.22
+            filteredRender = 0.72 * filteredRender + 0.28 * noise
+            render[index] = filteredRender
+            if (900 * 480..<1100 * 480).contains(index) {
+                voiceSeed = voiceSeed &* 1_103_515_245 &+ 12_345
+                let breath = Float(Int32(bitPattern: voiceSeed)) / 2_147_483_648 * 0.04
+                filteredVoice = 0.82 * filteredVoice + 0.18 * breath
+                let t = Double(index) / Double(rate)
+                let phase = 2 * Double.pi * (170 * t + 4 * sin(2 * Double.pi * 1.3 * t))
+                let envelope = Float(0.4 + 0.6 * pow(sin(2 * Double.pi * 2.1 * t), 2))
+                let harmonics = Float(sin(phase) + 0.5 * sin(3 * phase) + 0.25 * sin(5 * phase))
+                voice[index] = envelope * (0.008 * harmonics + 0.2 * filteredVoice)
+            }
+            capture[index] = voice[index] + (index >= echoDelay ? 0.62 * render[index - echoDelay] : 0)
+        }
+        let processor = try MeetingAECProcessor()
+        for frame in 0..<frames {
+            let range = frame * 480..<(frame + 1) * 480
+            let result = try processor.process(render: Array(render[range]), capture: Array(capture[range]))
+            XCTAssertTrue(result.samples.allSatisfy { $0.isFinite && (-1...1).contains($0) })
+            output.replaceSubrange(range, with: result.samples)
+        }
+        func energy(_ samples: [Float], _ range: Range<Int>) -> Double {
+            range.reduce(0) { $0 + Double(samples[$1]) * Double(samples[$1]) }
+        }
+        let echoOnly = 700 * 480..<900 * 480
+        let echoReduction = 10 * log10(energy(capture, echoOnly) / energy(output, echoOnly))
+        XCTAssertGreaterThan(echoReduction, 20, "Video-only echo must remain suppressed")
+        // The pinned 48 kHz processor has a 433-sample filter-bank delay. Correlate
+        // against the independent known voice so residual echo cannot pass this test.
+        let speech = 900 * 480 + 4800..<1100 * 480 - 4800
+        let dot = speech.reduce(0.0) { $0 + Double(output[$1 + 433]) * Double(voice[$1]) }
+        let voiceGain = 20 * log10(abs(dot / energy(voice, speech)))
+        XCTAssertGreaterThan(voiceGain, -8, "Quiet local speech must survive overlapping playback")
+    }
+
     func testAECProvenanceIsBackwardCompatibleAndSoftwareProtectionAdmits() throws {
         XCTAssertTrue(MeetingMicrophoneEchoProtection.softwareEchoCancelled.admitsTranscript)
         let legacy = Data("""
