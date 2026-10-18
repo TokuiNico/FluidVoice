@@ -3230,7 +3230,7 @@ nonisolated enum DictionaryPronunciationRevisionPolicy {
     ) -> String? {
         guard descriptor.variant == .mini || descriptor.variant == .pico else { return nil }
         let current = Set(profiles.filter {
-            $0.modelKey == descriptor.pronunciationModelKey && $0.isEligibleForMatching
+            ParakeetSpeechModelCatalog.sharesPronunciationFamily($0.modelKey, with: descriptor.pronunciationModelKey) && $0.isEligibleForMatching
         }.map(\.dictionaryEntryID))
         let outdated = profiles.filter {
             entryIDs.contains($0.dictionaryEntryID) && !current.contains($0.dictionaryEntryID)

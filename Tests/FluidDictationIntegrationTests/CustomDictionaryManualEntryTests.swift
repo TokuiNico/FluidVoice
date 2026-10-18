@@ -845,3 +845,45 @@ extension CustomDictionaryManualEntryTests {
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path).count, 1)
     }
 }
+
+#if arch(arm64)
+extension CustomDictionaryManualEntryTests {
+    /// Opt-in local replay uses saved audio read-only; never changes the user's dictionary.
+    func testParakeetFamilySavedAudioReplay() async throws {
+        guard ProcessInfo.processInfo.environment["FV_DICTIONARY_FAMILY_REPLAY"] == "1" else {
+            throw XCTSkip("Set FV_DICTIONARY_FAMILY_REPLAY=1 to replay local dictionary audio")
+        }
+        let profiles = await PronunciationDictionaryStore.shared.allProfiles()
+        let source = try XCTUnwrap(profiles.first {
+            $0.modelKey == "parakeet-v2" && $0.hasTemporalRecordings && $0.enrollments.count >= 3
+        })
+        let audioID = try XCTUnwrap(source.enrollments.last?.inspectionID)
+        let audio = try await PronunciationDictionaryStore.shared.inspection(for: audioID)
+        let samples = Array(audio.samples.prefix(audio.recordedSampleCount))
+        var entryIDs = Set<UUID>()
+        let entries = profiles.filter { entryIDs.insert($0.dictionaryEntryID).inserted }.map {
+            SettingsStore.CustomDictionaryEntry(id: $0.dictionaryEntryID, triggers: [], replacement: $0.label)
+        }
+        let provider = FluidAudioProvider(
+            modelOverride: .fluidParakeetMini,
+            configureWordBoosting: false,
+            enhancementOptions: FluidAudioProviderEnhancementOptions(experimentalUnifiedFinalEnabled: false, pronunciationMatchingEnabled: true, customDictionaryEntries: entries)
+        )
+        try await provider.prepare()
+        await provider.pronunciationReferencePreparationTask?.value
+        let fixture = URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("Resources/dictation_fixture.wav")
+        let negativeSamples = try AudioConverter().resampleAudioFile(path: fixture.path)
+        DictionaryMatcherExperiment.setEnabled(false)
+        let baselinePositive = try await provider.transcribeFinal(samples)
+        let baselineNegative = try await provider.transcribeFinal(negativeSamples)
+        DictionaryMatcherExperiment.setEnabled(true)
+        provider.resetStreamingPreviewCache()
+        let positive = try await provider.transcribeFinal(samples)
+        print("FAMILY_REPLAY source=\(source.modelKey) target=\(provider.pronunciationModelKeyForTesting) expected=\(source.label) baseline=\(baselinePositive.text) output=\(positive.text)")
+        XCTAssertTrue(positive.text.localizedCaseInsensitiveContains(source.label))
+        let negative = try await provider.transcribeFinal(negativeSamples)
+        print("FAMILY_REPLAY negative=\(negative.text)")
+        XCTAssertEqual(negative.text, baselineNegative.text, "The complete saved dictionary must leave unrelated speech unchanged")
+    }
+}
+#endif

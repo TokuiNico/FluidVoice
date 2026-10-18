@@ -363,7 +363,7 @@ final class FluidAudioProvider: TranscriptionProvider {
             self.didLoadAutomaticPronunciationProfiles = true
             return
         }
-        let stored = await self.pronunciationStore.profiles(modelKey: self.pronunciationModelKey)
+        let stored = await self.pronunciationStore.sharedProfiles(modelKey: self.pronunciationModelKey, hiddenSize: self.temporalModels?.version.encoderHiddenSize)
         try self.requireCurrentRecording(generation)
         self.automaticPronunciationProfiles = Self.matchingProfiles(
             stored,
@@ -611,7 +611,7 @@ final class FluidAudioProvider: TranscriptionProvider {
         }
 
         if DictionaryMatcherExperiment.sharedFeaturesEnabled, self.meetingOptions == nil {
-            let stored = await self.pronunciationStore.profiles(modelKey: self.pronunciationModelKey)
+            let stored = await self.pronunciationStore.sharedProfiles(modelKey: self.pronunciationModelKey, hiddenSize: self.temporalModels?.version.encoderHiddenSize)
             let eligible = Self.matchingProfiles(stored, entries: self.effectiveCustomDictionaryEntries, includeManual: self.explicitPronunciationMatchingEnabled)
             self.scheduleTemporalWarmup(eligible)
         }
@@ -1058,7 +1058,7 @@ final class FluidAudioProvider: TranscriptionProvider {
         guard self.effectivePronunciationMatchingEnabled else { return [] }
         let stored: [PronunciationDictionaryProfile]
         if self.explicitPronunciationMatchingEnabled {
-            stored = await self.pronunciationStore.profiles(modelKey: self.pronunciationModelKey)
+            stored = await self.pronunciationStore.sharedProfiles(modelKey: self.pronunciationModelKey, hiddenSize: self.temporalModels?.version.encoderHiddenSize)
         } else {
             stored = self.automaticPronunciationProfiles
         }
@@ -1273,7 +1273,7 @@ final class FluidAudioProvider: TranscriptionProvider {
     static func preparedEdgeProfiles(_ profiles: [PronunciationDictionaryProfile], cache: [UUID: PronunciationEmbedding]) -> [PronunciationDictionaryProfile] {
         guard DictionaryMatcherExperiment.sharedFeaturesEnabled else { return [] }
         return profiles.compactMap { profile in
-            if profile.hasOriginalAudio { return profile }
+            if profile.hasOriginalAudio || !profile.hasTemporalRecordings { return profile }
             var prepared = profile
             for index in prepared.enrollments.indices {
                 if prepared.enrollments[index].edgeEmbedding != nil { continue }
@@ -1355,15 +1355,23 @@ final class FluidAudioProvider: TranscriptionProvider {
                 used[match.prototypeIndex, default: []].append(range)
                 sharedComparisons += 1
                 let profile = profiles[match.prototypeIndex]
+                if !profile.hasTemporalRecordings {
+                    let heard = indices.map { words[$0].text }.joined(separator: " ")
+                    if DictionaryPronunciationDecision.accepts(score: match.score, heardText: heard, profile: profile) {
+                        output.append(match)
+                    }
+                    continue
+                }
                 let referenceKey = DictionaryNegativeEvidenceResolver.profileKey(profile)
                 // Old isolated-query negatives must not be compared with sentence-context queries.
-                let evidenceKey = referenceKey + ":shared-features-v1"
+                let targetSuffix = profile.modelKey == self.pronunciationModelKey ? "" : ":" + self.pronunciationModelKey
+                let evidenceKey = referenceKey + ":shared-features-v1" + targetSuffix
                 guard let query = Self.sharedPronunciationFrames(features, sampleRange: trimmed),
                       let references = self.temporalReferenceCache[referenceKey] else { continue }
                 guard let decision = await DictionaryExperimentalMatcher.compareSharedFeatures(query: query, references: references, chunked: sharedChunk) else { continue }
                 guard decision.accepted, DictionaryMatcherExperiment.sharedFeaturesEnabled else { continue }
                 if compareNegatives {
-                    let negatives = await DictionaryNegativeExampleStore.shared.frames(entryID: profile.dictionaryEntryID, profileKey: evidenceKey, modelKey: profile.modelKey)
+                    let negatives = await DictionaryNegativeExampleStore.shared.frames(entryID: profile.dictionaryEntryID, profileKey: evidenceKey, modelKey: self.pronunciationModelKey)
                     let allowed = await DictionaryExperimentalMatcher.compareNegative(query: query, references: references, negatives: negatives)
                     if !allowed, DictionaryMatcherExperiment.compareNegatives,
                        await DictionaryNegativeExampleStore.shared.revision() == negativeRevision { continue }
@@ -1373,7 +1381,7 @@ final class FluidAudioProvider: TranscriptionProvider {
                 temporalMatches.insert(TemporalMatchKey(prototypeIndex: match.prototypeIndex, frameRange: alignedFrames))
                 output.append(PronunciationWindowMatch(prototypeIndex: match.prototypeIndex, score: decision.meanRelative, frameRange: alignedFrames))
                 if collectNegatives, DictionaryMatcherExperiment.collectNegatives {
-                    evidence.append(DictionaryAcousticEvidence(id: UUID(), entryID: profile.dictionaryEntryID, label: profile.label, profileKey: evidenceKey, modelKey: profile.modelKey, sourceWordRange: first..<(last + 1), frames: query))
+                    evidence.append(DictionaryAcousticEvidence(id: UUID(), entryID: profile.dictionaryEntryID, label: profile.label, profileKey: evidenceKey, modelKey: self.pronunciationModelKey, sourceWordRange: first..<(last + 1), frames: query))
                 }
                 continue
             }
@@ -1431,8 +1439,9 @@ final class FluidAudioProvider: TranscriptionProvider {
 
     private func temporalReferences(_ profile: PronunciationDictionaryProfile, key: String, models: AsrModels) async throws -> [DictionaryMatchFrames] {
         guard DictionaryMatcherExperiment.sharedFeaturesEnabled else { return [] }
-        guard profile.modelKey == self.pronunciationModelKey,
-              profile.enrollments.allSatisfy({ $0.modelKey == profile.modelKey })
+        guard profile.modelKey == self.pronunciationModelKey ||
+            ParakeetSpeechModelCatalog.sharesPronunciationFamily(profile.modelKey, with: self.pronunciationModelKey),
+            profile.enrollments.allSatisfy({ $0.modelKey == profile.modelKey })
         else { throw PronunciationDictionaryStoreError.outdatedModelRevision }
         if let cached = self.temporalReferenceCache[key] { return cached }
         guard profile.enrollments.count >= 3 else { return [] }
