@@ -982,6 +982,47 @@ nonisolated struct MeetingSession: Codable, Identifiable, Equatable, Sendable {
         self.updatedAt = Date()
     }
 
+    /// Merge only the immediate matching neighbors of a manually tagged Unknown. Keep the
+    /// selected ID so correction/undo targets remain stable, and never combine audio tracks.
+    mutating func mergeTaggedSegmentWithNeighbors(id: MeetingTranscriptSegmentID) -> Set<MeetingTranscriptSegmentID> {
+        let ordered = self.transcriptSegments.enumerated().sorted {
+            ($0.element.start, $0.element.end, $0.offset) < ($1.element.start, $1.element.end, $1.offset)
+        }.map(\.element)
+        guard let position = ordered.firstIndex(where: { $0.id == id }),
+              let speakerID = ordered[position].speakerID,
+              !ordered[position].isEcho
+        else { return [id] }
+        let target = ordered[position]
+        func matches(_ candidate: MeetingTranscriptSegment) -> Bool {
+            candidate.speakerID == speakerID && candidate.sourceTrackID == target.sourceTrackID
+                && !candidate.isEcho && candidate.overlap == .none
+                && (candidate.attributionState == nil || candidate.attributionState == .assigned)
+                && candidate.status == target.status && candidate.completeness == target.completeness
+        }
+        var pieces = [target]
+        if position > 0, matches(ordered[position - 1]) { pieces.insert(ordered[position - 1], at: 0) }
+        if position + 1 < ordered.count, matches(ordered[position + 1]) { pieces.append(ordered[position + 1]) }
+        let ids = Set(pieces.map(\.id))
+        guard pieces.count > 1, let index = self.transcriptSegments.firstIndex(where: { $0.id == id }) else { return ids }
+        func joined(_ values: [String]) -> String {
+            values.reduce("") { left, right in
+                guard !left.isEmpty else { return right }
+                guard let first = right.unicodeScalars.first else { return left }
+                return left + (CharacterSet.punctuationCharacters.contains(first) ? "" : " ") + right
+            }
+        }
+        var merged = target
+        merged.start = pieces.map(\.start).min() ?? target.start
+        merged.end = pieces.map(\.end).max() ?? target.end
+        merged.text = joined(pieces.map(\.text))
+        if pieces.contains(where: { $0.originalText != nil }) {
+            merged.originalText = joined(pieces.map { $0.originalText ?? $0.text })
+        }
+        self.transcriptSegments[index] = merged
+        self.transcriptSegments.removeAll { $0.id != id && ids.contains($0.id) }
+        return ids
+    }
+
     /// Gives one unresolved segment its own manual speaker identity. The identity is intentionally
     /// scoped to this segment: naming one unknown must never rename or relabel another unknown.
     @discardableResult

@@ -360,11 +360,10 @@ final class MeetingParakeetNemotronBackendTests: XCTestCase {
         XCTAssertEqual(turns.map(\.speakerID), [speakerA, speakerB, speakerA])
     }
 
-    func testCanonicalMergeKeepsAAmbiguousAAsThreeTurns() {
+    func testCanonicalMergeAttachesUnknownWordsToPreviousSpeaker() {
         let trackID = UUID()
         let speakerA = UUID()
-        // The ambiguous segment has no resolved speaker and a different overlap state, so its
-        // key differs from both surrounding A segments even though all three are on one track.
+        // Product transcript joins the Unknown word to the preceding speaker's turn.
         let input = [
             self.canonicalSegment(trackID: trackID, start: 0, end: 1.0, speakerID: speakerA, text: "First"),
             self.canonicalSegment(
@@ -375,9 +374,73 @@ final class MeetingParakeetNemotronBackendTests: XCTestCase {
 
         let turns = MeetingProcessingPipeline.mergeCanonicalSegments(input)
 
-        XCTAssertEqual(turns.count, 3)
-        XCTAssertEqual(turns.map(\.text), ["First", "Maybe", "Second"])
-        XCTAssertEqual(turns.map(\.overlap), [.none, .ambiguous, .none])
+        XCTAssertEqual(turns.count, 1)
+        XCTAssertEqual(turns.map(\.text), ["First Maybe Second"])
+        XCTAssertEqual(turns.map(\.speakerID), [speakerA])
+        XCTAssertEqual(turns.map(\.overlap), [.none])
+    }
+
+    func testUnknownInheritanceKeepsOpeningUnknownAndUsesPreviousNotNextSpeaker() {
+        let track = UUID()
+        let first = UUID()
+        let second = UUID()
+        var ambiguous = self.canonicalSegment(trackID: track, start: 1.2, end: 1.4, speakerID: nil, text: "tail", overlap: .ambiguous)
+        ambiguous.attributionState = .overlappingSpeakers
+        var uncertain = self.canonicalSegment(trackID: track, start: 1.4, end: 1.6, speakerID: second, text: "two")
+        uncertain.attributionState = .timingUncertain
+        let input = [
+            self.canonicalSegment(trackID: track, start: 0, end: 0.2, speakerID: nil, text: "opening"),
+            self.canonicalSegment(trackID: track, start: 0.5, end: 1, speakerID: first, text: "first"),
+            ambiguous, uncertain,
+            self.canonicalSegment(trackID: track, start: 2, end: 3, speakerID: second, text: "second"),
+            self.canonicalSegment(trackID: track, start: 3, end: 3.2, speakerID: nil, text: "ending"),
+        ]
+        let output = MeetingProcessingPipeline.inheritPreviousSpeaker(input.reversed())
+        XCTAssertEqual(output.map(\.speakerID), [nil, first, first, first, second, second])
+        for (before, after) in zip(input, output) {
+            XCTAssertEqual(before.id, after.id)
+            XCTAssertEqual(before.text, after.text)
+            XCTAssertEqual(before.start, after.start)
+            XCTAssertEqual(before.end, after.end)
+            XCTAssertEqual(before.sourceTrackID, after.sourceTrackID)
+            XCTAssertEqual(before.revision, after.revision)
+        }
+        XCTAssertEqual(MeetingProcessingPipeline.inheritPreviousSpeaker(output), output)
+        XCTAssertNil(input[2].speakerID, "raw input evidence is unchanged")
+    }
+
+    func testUnknownInheritanceUsesChronologicalSpeakerAcrossTracksWithoutMovingAudio() {
+        let mic = UUID()
+        let app = UUID()
+        let first = UUID()
+        let second = UUID()
+        let input = [
+            self.canonicalSegment(trackID: mic, start: 0, end: 1, speakerID: first, text: "mic"),
+            self.canonicalSegment(trackID: app, start: 1, end: 2, speakerID: second, text: "app"),
+            self.canonicalSegment(trackID: mic, start: 2, end: 2.3, speakerID: nil, text: "tail"),
+        ]
+        let output = MeetingProcessingPipeline.inheritPreviousSpeaker(input)
+        XCTAssertEqual(output.last?.speakerID, second)
+        XCTAssertEqual(output.last?.sourceTrackID, mic)
+        let turns = MeetingProcessingPipeline.mergeCanonicalSegments(input)
+        XCTAssertEqual(turns.count, 3, "separate audio tracks keep separate playback ranges")
+    }
+
+    func testUnknownInheritanceSkipsEchoesAsBothTargetsAndAnchors() {
+        let track = UUID()
+        let first = UUID()
+        let second = UUID()
+        let input = [
+            self.canonicalSegment(trackID: track, start: 0, end: 1, speakerID: first, text: "first"),
+            self.canonicalSegment(trackID: track, start: 1, end: 1.2, speakerID: second, text: "echo", isLikelyEcho: true),
+            self.canonicalSegment(trackID: track, start: 1.3, end: 1.4, speakerID: nil, text: "unknown echo", isLikelyEcho: true),
+            self.canonicalSegment(trackID: track, start: 1.4, end: 1.6, speakerID: nil, text: "tail"),
+        ]
+        let output = MeetingProcessingPipeline.inheritPreviousSpeaker(input)
+        XCTAssertEqual(output[1], input[1])
+        XCTAssertEqual(output[2], input[2])
+        XCTAssertEqual(output.last?.speakerID, first)
+        XCTAssertEqual(MeetingProcessingPipeline.inheritPreviousSpeaker([]), [])
     }
 
     func testCanonicalMergeCombinesAdjacentSameKeySegments() {

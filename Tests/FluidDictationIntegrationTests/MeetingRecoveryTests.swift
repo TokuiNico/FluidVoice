@@ -694,7 +694,7 @@ final class MeetingRecoveryTests: XCTestCase {
                         onNameUnknownSegment: { _, _, _ in action() },
                         onRenameSpeaker: { _, _, _ in action() },
                         onMergeSpeakers: { _, _, _ in action() },
-                        onUndoCorrection: { _ in action() },
+                        onUndoCorrection: { _ in action(); return false },
                         onRenameSession: { _, _ in action() },
                         onAssignSpeakers: { _, _ in action(); return nil },
                         canUndoCorrection: { _ in false },
@@ -1142,7 +1142,7 @@ final class MeetingRecoveryTests: XCTestCase {
             onNameUnknownSegment: { _, _, _ in actions.record() },
             onRenameSpeaker: { _, _, _ in actions.record() },
             onMergeSpeakers: { _, _, _ in actions.record() },
-            onUndoCorrection: { _ in actions.record() },
+            onUndoCorrection: { _ in actions.record(); return false },
             onRenameSession: { _, _ in actions.record() },
             onAssignSpeakers: { _, _ in actions.record(); return nil },
             canUndoCorrection: { _ in false },
@@ -1468,6 +1468,38 @@ final class MeetingRecoveryTests: XCTestCase {
     }
 
     // MARK: - Test 2: multi-session restore
+
+    func testRecoveryInspectsFinalizedTrackMissingFromFailedSessionSnapshot() async throws {
+        let dir = self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = MeetingSessionStore(rootDirectory: dir)
+        let session = self.makeSession(
+            state: .failed,
+            endedAt: Date(),
+            failures: [MeetingSessionFailure(
+                id: UUID(),
+                occurredAt: Date(),
+                domain: .capture,
+                code: "interrupted",
+                message: "Interrupted",
+                recoverable: true
+            )]
+        )
+        try await store.create(session)
+        let directory = try await store.sessionDirectory(for: session.id)
+        let chunk = self.makeFinalizedChunk()
+        let track = self.makeMicrophoneTrack(chunks: [chunk])
+        let fileURL = chunk.fileURL(relativeTo: directory)
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data([1, 2, 3, 4]).write(to: fileURL)
+        try JSONEncoder().encode(track).write(to: fileURL.deletingLastPathComponent().appendingPathComponent("track.json"))
+
+        let history = try await store.loadHistory()
+        XCTAssertEqual(history.first?.audioTracks, [], "browsing does not reconcile crash-window audio")
+        let recovered = try await store.loadRecoverable()
+        XCTAssertEqual(recovered.map(\.id), [session.id])
+        XCTAssertEqual(recovered.first?.audioTracks.first?.chunks.first?.byteCount, 4)
+    }
 
     func testMultiSessionRestoreSelectsNewestViableAndDefersOthers() async throws {
         let dir = self.makeTempDirectory()
@@ -3068,6 +3100,75 @@ final class MeetingRecoveryTests: XCTestCase {
         // A history-scoped correction never adopts the session into a coordinator slot.
         XCTAssertNil(coordinator.activeSession)
         XCTAssertNil(coordinator.latestCompletedSession)
+    }
+
+    func testTaggingUnknownMergesMatchingNeighborsAndUndoRestoresAllWords() async throws {
+        let dir = self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = MeetingSessionStore(rootDirectory: dir)
+        var (session, speakerA, speakerB, _) = self.makeCorrectionSession(state: .completed)
+        let base = session.transcriptSegments[0]
+        func part(_ text: String, _ start: Int64, _ speaker: SessionSpeakerID?) -> MeetingTranscriptSegment {
+            var value = base
+            value.id = UUID()
+            value.text = text
+            value.start = .init(value: start, timescale: 1000)
+            value.end = .init(value: start + 200, timescale: 1000)
+            value.speakerID = speaker
+            value.attributionState = speaker == nil ? .unassigned : .assigned
+            return value
+        }
+        let left = part("the", 0, speakerA)
+        let unknown = part("home.", 200, nil)
+        let right = part("Another", 400, speakerA)
+        let different = part("speaker", 600, speakerB)
+        session.transcriptSegments = [left, unknown, right, different]
+        try await store.create(session)
+        let coordinator = MeetingSessionCoordinator(
+            store: store, capture: StubCaptureController(), processing: StubProcessingController(), audioArbiter: StubArbiter()
+        )
+        let tagged = try await coordinator.reassignSegment(sessionID: session.id, segmentID: unknown.id, to: speakerA)
+        XCTAssertEqual(tagged.transcriptSegments.map(\.text), ["the home. Another", "speaker"])
+        XCTAssertEqual(tagged.transcriptSegments[0].id, unknown.id)
+        XCTAssertEqual(tagged.transcriptSegments[0].speakerID, speakerA)
+        XCTAssertEqual(tagged.transcriptSegments[0].start, left.start)
+        XCTAssertEqual(tagged.transcriptSegments[0].end, right.end)
+        XCTAssertEqual(tagged.audioTracks, session.audioTracks)
+        XCTAssertEqual(tagged.speakers, session.speakers)
+        let loaded = try await store.load(id: session.id)
+        XCTAssertEqual(loaded?.transcriptSegments, tagged.transcriptSegments)
+        let undone = try await coordinator.undoTranscriptCorrection(sessionID: session.id)
+        XCTAssertEqual(undone.transcriptSegments, session.transcriptSegments)
+        XCTAssertEqual(undone.audioTracks, session.audioTracks)
+    }
+
+    func testTaggingUnknownDoesNotMergeAcrossAnotherSpeakerOrAudioTrack() throws {
+        var (session, speakerA, speakerB, _) = self.makeCorrectionSession(state: .completed)
+        let base = session.transcriptSegments[0]
+        func part(_ text: String, _ start: Int64, _ speaker: SessionSpeakerID?, track: MeetingAudioTrackID? = nil) -> MeetingTranscriptSegment {
+            var value = base
+            value.id = UUID()
+            value.text = text
+            value.start = .init(value: start, timescale: 1000)
+            value.end = .init(value: start + 200, timescale: 1000)
+            value.speakerID = speaker
+            value.attributionState = speaker == nil ? .unassigned : .assigned
+            if let track { value.sourceTrackID = track }
+            return value
+        }
+        let earlier = part("Earlier", 0, speakerA)
+        let interruption = part("Interruption", 200, speakerB)
+        let unknown = part("word", 400, nil)
+        let differentTrack = part("Other track", 600, speakerA, track: UUID())
+        session.transcriptSegments = [earlier, interruption, unknown, differentTrack]
+        try session.reassignSegment(id: unknown.id, to: speakerA)
+        let assigned = session.transcriptSegments
+        XCTAssertEqual(session.mergeTaggedSegmentWithNeighbors(id: unknown.id), [unknown.id])
+        XCTAssertEqual(session.transcriptSegments, assigned)
+        // A right-hand match joins even if the preceding speaker is different.
+        session.transcriptSegments[3].sourceTrackID = unknown.sourceTrackID
+        _ = session.mergeTaggedSegmentWithNeighbors(id: unknown.id)
+        XCTAssertEqual(session.transcriptSegments.map(\.text), ["Earlier", "Interruption", "word Other track"])
     }
 
     func testUndoRestoresExactPriorStateForEachCorrectionType() async throws {

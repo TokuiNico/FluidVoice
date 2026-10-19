@@ -173,10 +173,7 @@ final class MeetingSessionCoordinator: ObservableObject {
         case rename(speakerID: SessionSpeakerID, previousName: String)
         case reassign(
             segmentID: MeetingTranscriptSegmentID,
-            previousSpeakerID: SessionSpeakerID?,
-            previousOverlap: MeetingTranscriptOverlap,
-            previousAttributionState: MeetingTranscriptAttributionState?,
-            previousRevision: Int
+            previousSegments: [(index: Int, segment: MeetingTranscriptSegment)]
         )
         case nameUnknown(
             segmentID: MeetingTranscriptSegmentID,
@@ -877,7 +874,7 @@ final class MeetingSessionCoordinator: ObservableObject {
     private func resolveSession(_ id: MeetingSessionID) async throws -> MeetingSession {
         if let active = self.activeSession, active.id == id { return active }
         if let completed = self.latestCompletedSession, completed.id == id { return completed }
-        if let loaded = try await self.store.load(id: id) { return loaded }
+        if let loaded = try await self.store.loadTranscript(id: id) { return loaded }
         throw MeetingCoordinatorError.noActiveMeeting
     }
 
@@ -946,17 +943,16 @@ final class MeetingSessionCoordinator: ObservableObject {
             guard let segment = session.transcriptSegments.first(where: { $0.id == segmentID }) else {
                 throw MeetingDomainError.segmentNotFound
             }
-            let previousSpeakerID = segment.speakerID
-            let previousOverlap = segment.overlap
-            let previousAttributionState = segment.attributionState
-            let previousRevision = segment.revision
+            let before = session.transcriptSegments
             try session.reassignSegment(id: segmentID, to: speakerID)
+            let affectedIDs = segment.speakerID == nil
+                ? session.mergeTaggedSegmentWithNeighbors(id: segmentID)
+                : Set([segmentID])
             return .reassign(
                 segmentID: segmentID,
-                previousSpeakerID: previousSpeakerID,
-                previousOverlap: previousOverlap,
-                previousAttributionState: previousAttributionState,
-                previousRevision: previousRevision
+                previousSegments: before.enumerated().compactMap {
+                    affectedIDs.contains($0.element.id) ? (index: $0.offset, segment: $0.element) : nil
+                }
             )
         }
     }
@@ -1130,7 +1126,7 @@ final class MeetingSessionCoordinator: ObservableObject {
 
         let sessions: [MeetingSession]
         do {
-            sessions = try await self.store.loadAll()
+            sessions = try await self.store.loadHistory()
         } catch {
             DebugLogger.shared.warning(
                 "Retention sweep could not load sessions; leaving the current timer as-is: \(error)",
@@ -1235,18 +1231,12 @@ final class MeetingSessionCoordinator: ObservableObject {
             guard let index = session.speakers.firstIndex(where: { $0.id == speakerID }) else { return false }
             session.speakers[index].displayName = previousName
             return true
-        case let .reassign(
-            segmentID,
-            previousSpeakerID,
-            previousOverlap,
-            previousAttributionState,
-            previousRevision
-        ):
-            guard let index = session.transcriptSegments.firstIndex(where: { $0.id == segmentID }) else { return false }
-            session.transcriptSegments[index].speakerID = previousSpeakerID
-            session.transcriptSegments[index].overlap = previousOverlap
-            session.transcriptSegments[index].attributionState = previousAttributionState
-            session.transcriptSegments[index].revision = previousRevision
+        case let .reassign(segmentID, previousSegments):
+            guard session.transcriptSegments.contains(where: { $0.id == segmentID }) else { return false }
+            session.transcriptSegments.removeAll { $0.id == segmentID }
+            for original in previousSegments.sorted(by: { $0.index < $1.index }) {
+                session.transcriptSegments.insert(original.segment, at: min(original.index, session.transcriptSegments.count))
+            }
             return true
         case let .nameUnknown(
             segmentID,

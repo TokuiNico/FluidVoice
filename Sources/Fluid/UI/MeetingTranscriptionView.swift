@@ -104,6 +104,62 @@ struct MeetingSetupReadiness: Equatable {
     )
 }
 
+/// Registers only this meeting's saved corrections with the window's native Undo command.
+@MainActor
+final class MeetingCorrectionUndoRegistration: ObservableObject {
+    private weak var manager: UndoManager?
+    private var sessionID: MeetingSessionID?
+    private var isEnabled = false
+    private var action: (@MainActor () async -> Bool)?
+    private var task: Task<Void, Never>?
+    private var generation = UUID()
+
+    func refresh(manager: UndoManager?, sessionID: MeetingSessionID, isEnabled: Bool, action: @escaping @MainActor () async -> Bool) {
+        if self.manager !== manager || self.sessionID != sessionID { self.detach() }
+        self.manager = manager
+        self.sessionID = sessionID
+        self.isEnabled = isEnabled
+        self.action = action
+        if self.task == nil { self.install() }
+    }
+
+    func detach() {
+        self.manager?.removeAllActions(withTarget: self)
+        self.manager = nil
+        self.sessionID = nil
+        self.action = nil
+        self.isEnabled = false
+        self.generation = UUID()
+        // An authorized save may finish after navigation, but must never register Undo in
+        // the next meeting or another page. Do not cancel persistence mid-write.
+        self.task = nil
+    }
+
+    private func install() {
+        guard let manager = self.manager else { return }
+        manager.removeAllActions(withTarget: self)
+        guard self.isEnabled else { return }
+        manager.beginUndoGrouping()
+        manager.registerUndo(withTarget: self) { $0.performUndo() }
+        manager.setActionName("Meeting Correction")
+        manager.endUndoGrouping()
+    }
+
+    private func performUndo() {
+        guard self.isEnabled, self.task == nil, let action = self.action else { return }
+        let generation = self.generation
+        self.task = Task { @MainActor in
+            let hasMore = await action()
+            guard self.generation == generation else { return }
+            self.task = nil
+            self.isEnabled = self.isEnabled && hasMore
+            // Register after the async save, outside UndoManager's undo callback. This is
+            // another correction to undo, not a redo. A failed save remains retryable.
+            self.install()
+        }
+    }
+}
+
 /// Owned by the window, so leaving FluidMeet does not discard its last loaded history.
 @MainActor
 final class MeetingHistorySnapshot: ObservableObject {
@@ -115,9 +171,21 @@ final class MeetingHistorySnapshot: ObservableObject {
     private var refreshRequested = false
 
     init(load: @escaping @Sendable () async throws -> [MeetingSession] = {
-        try await MeetingSessionStore.shared.loadAll()
+        try await MeetingSessionStore.shared.loadHistory()
     }) {
         self.load = load
+    }
+
+    /// A correction already returned the saved session. Publish it without rereading every
+    /// meeting and probing all their audio chunks. An older in-flight read must not undo it.
+    func applySavedSession(_ session: MeetingSession) {
+        if let index = self.sessions.firstIndex(where: { $0.id == session.id }) {
+            self.sessions[index] = session
+        } else {
+            self.sessions.append(session)
+            self.sessions.sort { $0.startedAt > $1.startedAt }
+        }
+        if self.refreshTask != nil { self.refreshRequested = true }
     }
 
     func refresh() async {
@@ -786,11 +854,11 @@ struct MeetingTranscriptionView: View {
         self.actionErrorMessage = nil
         Task {
             do {
-                _ = try await self.coordinator.reassignSegment(sessionID: sessionID, segmentID: segmentID, to: speakerID)
+                let saved = try await self.coordinator.reassignSegment(sessionID: sessionID, segmentID: segmentID, to: speakerID)
+                self.historySnapshot.applySavedSession(saved)
             } catch {
                 self.actionErrorMessage = error.localizedDescription
             }
-            await self.loadMeetingHistory()
         }
     }
 
@@ -802,15 +870,15 @@ struct MeetingTranscriptionView: View {
         self.actionErrorMessage = nil
         Task {
             do {
-                _ = try await self.coordinator.nameUnknownSegment(
+                let saved = try await self.coordinator.nameUnknownSegment(
                     sessionID: sessionID,
                     segmentID: segmentID,
                     displayName: displayName
                 )
+                self.historySnapshot.applySavedSession(saved)
             } catch {
                 self.actionErrorMessage = error.localizedDescription
             }
-            await self.loadMeetingHistory()
         }
     }
 
@@ -818,18 +886,18 @@ struct MeetingTranscriptionView: View {
         self.actionErrorMessage = nil
         Task {
             do {
-                _ = try await self.coordinator.renameSpeaker(sessionID: sessionID, speakerID: speakerID, to: displayName)
+                let saved = try await self.coordinator.renameSpeaker(sessionID: sessionID, speakerID: speakerID, to: displayName)
+                self.historySnapshot.applySavedSession(saved)
             } catch {
                 self.actionErrorMessage = error.localizedDescription
             }
-            await self.loadMeetingHistory()
         }
     }
 
     private func editTranscriptSegment(sessionID: MeetingSessionID, segmentID: MeetingTranscriptSegmentID, text: String, revision: Int) async -> String? {
         do {
-            _ = try await self.coordinator.editTranscriptText(sessionID: sessionID, segmentID: segmentID, text: text, expectedRevision: revision)
-            await self.loadMeetingHistory()
+            let saved = try await self.coordinator.editTranscriptText(sessionID: sessionID, segmentID: segmentID, text: text, expectedRevision: revision)
+            self.historySnapshot.applySavedSession(saved)
             return nil
         } catch {
             return error.localizedDescription
@@ -840,11 +908,11 @@ struct MeetingTranscriptionView: View {
         self.actionErrorMessage = nil
         var errorMessage: String?
         do {
-            _ = try await self.coordinator.renameSpeakers(sessionID: sessionID, names: names)
+            let saved = try await self.coordinator.renameSpeakers(sessionID: sessionID, names: names)
+            self.historySnapshot.applySavedSession(saved)
         } catch {
             errorMessage = error.localizedDescription
         }
-        await self.loadMeetingHistory()
         return errorMessage
     }
 
@@ -852,11 +920,11 @@ struct MeetingTranscriptionView: View {
         self.actionErrorMessage = nil
         Task {
             do {
-                _ = try await self.coordinator.mergeSpeakers(sessionID: sessionID, source: source, into: targetID)
+                let saved = try await self.coordinator.mergeSpeakers(sessionID: sessionID, source: source, into: targetID)
+                self.historySnapshot.applySavedSession(saved)
             } catch {
                 self.actionErrorMessage = error.localizedDescription
             }
-            await self.loadMeetingHistory()
         }
     }
 
@@ -864,24 +932,23 @@ struct MeetingTranscriptionView: View {
         self.actionErrorMessage = nil
         Task {
             do {
-                _ = try await self.coordinator.renameSession(sessionID: sessionID, to: title)
+                let saved = try await self.coordinator.renameSession(sessionID: sessionID, to: title)
+                self.historySnapshot.applySavedSession(saved)
             } catch {
                 self.actionErrorMessage = error.localizedDescription
             }
-            await self.loadMeetingHistory()
         }
     }
 
-    private func undoTranscriptCorrection(sessionID: MeetingSessionID) {
+    private func undoTranscriptCorrection(sessionID: MeetingSessionID) async -> Bool {
         self.actionErrorMessage = nil
-        Task {
-            do {
-                _ = try await self.coordinator.undoTranscriptCorrection(sessionID: sessionID)
-            } catch {
-                self.actionErrorMessage = error.localizedDescription
-            }
-            await self.loadMeetingHistory()
+        do {
+            let saved = try await self.coordinator.undoTranscriptCorrection(sessionID: sessionID)
+            self.historySnapshot.applySavedSession(saved)
+        } catch {
+            self.actionErrorMessage = error.localizedDescription
         }
+        return self.coordinator.canUndoCorrection(sessionID: sessionID)
     }
 
     private func deleteSession(id: MeetingSessionID) {
@@ -1390,7 +1457,7 @@ struct MeetingTranscriptionCanvas: View {
     let onNameUnknownSegment: (MeetingSessionID, MeetingTranscriptSegmentID, String) -> Void
     let onRenameSpeaker: (MeetingSessionID, SessionSpeakerID, String) -> Void
     let onMergeSpeakers: (MeetingSessionID, SessionSpeakerID, SessionSpeakerID) -> Void
-    let onUndoCorrection: (MeetingSessionID) -> Void
+    let onUndoCorrection: (MeetingSessionID) async -> Bool
     let onRenameSession: (MeetingSessionID, String) -> Void
     let onAssignSpeakers: (MeetingSessionID, [SessionSpeakerID: String]) async -> String?
     let canUndoCorrection: (MeetingSessionID) -> Bool
@@ -1498,7 +1565,7 @@ struct MeetingTranscriptionCanvas: View {
                         onMergeSpeakers: { source, target in
                             self.onMergeSpeakers(session.id, source, target)
                         },
-                        onUndo: { self.onUndoCorrection(session.id) },
+                        onUndo: { await self.onUndoCorrection(session.id) },
                         onRenameSession: { title in self.onRenameSession(session.id, title) },
                         onAssignSpeakers: { names in await self.onAssignSpeakers(session.id, names) },
                         onClose: self.onCloseSelection,

@@ -490,6 +490,69 @@ final class MeetingHistorySnapshotTests: XCTestCase {
         )
     }
 
+    func testSavedCorrectionUpdatesOnlyItsMeetingWithoutDiskReload() async {
+        let loader = HistorySnapshotLoader()
+        let snapshot = MeetingHistorySnapshot { try await loader.load() }
+        let original = self.session()
+        let other = self.session()
+        let initial = Task { await snapshot.refresh() }
+        await loader.waitForCall(1)
+        loader.finish(.success([original, other]))
+        await initial.value
+        var corrected = original
+        corrected.title = "Corrected"
+        snapshot.applySavedSession(corrected)
+        XCTAssertEqual(snapshot.sessions, [corrected, other])
+        XCTAssertEqual(loader.calls, 1, "publishing a saved correction performs no history read")
+        snapshot.applySavedSession(original) // Undo uses the same publication path.
+        XCTAssertEqual(snapshot.sessions, [original, other])
+        XCTAssertEqual(loader.calls, 1)
+    }
+
+    func testRapidCorrectionsCannotBeOverwrittenByAnOlderHistoryRead() async {
+        let loader = HistorySnapshotLoader()
+        let snapshot = MeetingHistorySnapshot { try await loader.load() }
+        let original = self.session()
+        let initial = Task { await snapshot.refresh() }
+        await loader.waitForCall(1)
+        loader.finish(.success([original]))
+        await initial.value
+        let refresh = Task { await snapshot.refresh() }
+        await loader.waitForCall(2)
+        var first = original
+        first.title = "First correction"
+        snapshot.applySavedSession(first)
+        var second = first
+        second.title = "Second correction"
+        snapshot.applySavedSession(second)
+        XCTAssertEqual(snapshot.sessions, [second])
+        loader.finish(.success([original]))
+        await loader.waitForCall(3)
+        XCTAssertEqual(snapshot.sessions, [second], "stale rows never replace the saved result")
+        loader.finish(.failure(NSError(domain: "test", code: 1)))
+        await refresh.value
+        XCTAssertEqual(snapshot.sessions, [second], "refresh failure keeps the saved correction")
+        XCTAssertEqual(loader.calls, 3, "rapid corrections coalesce into one follow-up read")
+    }
+
+    func testSavedSessionDuringInitialLoadIsNotLostOrDuplicated() async {
+        let loader = HistorySnapshotLoader()
+        let snapshot = MeetingHistorySnapshot { try await loader.load() }
+        let saved = self.session()
+        let initial = Task { await snapshot.refresh() }
+        await loader.waitForCall(1)
+        snapshot.applySavedSession(saved)
+        snapshot.applySavedSession(saved)
+        XCTAssertEqual(snapshot.sessions, [saved])
+        loader.finish(.success([]))
+        await loader.waitForCall(2)
+        XCTAssertEqual(snapshot.sessions, [saved])
+        loader.finish(.success([saved]))
+        await initial.value
+        XCTAssertEqual(snapshot.sessions, [saved])
+        XCTAssertTrue(snapshot.hasLoaded)
+    }
+
     func testSnapshotKeepsRowsDuringRefreshAndFailureThenRecovers() async {
         let loader = HistorySnapshotLoader()
         let snapshot = MeetingHistorySnapshot { try await loader.load() }
@@ -543,6 +606,105 @@ final class MeetingHistorySnapshotTests: XCTestCase {
         XCTAssertTrue(snapshot.hasLoaded)
         XCTAssertTrue(snapshot.sessions.isEmpty)
     }
+}
+
+@MainActor
+final class MeetingCorrectionUndoRegistrationTests: XCTestCase {
+    func testNativeUndoWalksCorrectionsAndStopsWithoutCreatingRedo() async {
+        let manager = UndoManager()
+        manager.groupsByEvent = false
+        let registration = MeetingCorrectionUndoRegistration()
+        defer { registration.detach() }
+        var count = 0
+        let calls = (0..<3).map { self.expectation(description: "Undo \($0)") }
+        registration.refresh(manager: manager, sessionID: UUID(), isEnabled: true) {
+            calls[count].fulfill()
+            count += 1
+            return count < 3
+        }
+        XCTAssertEqual(manager.undoActionName, "Meeting Correction")
+        for call in calls {
+            XCTAssertTrue(manager.canUndo)
+            manager.undo()
+            await self.fulfillment(of: [call], timeout: 2)
+        }
+        XCTAssertEqual(count, 3)
+        XCTAssertFalse(manager.canUndo)
+        XCTAssertFalse(manager.canRedo)
+    }
+
+    func testEditingAndLeavingOnlyRemoveMeetingUndoNotOtherTextUndo() {
+        let manager = UndoManager()
+        manager.groupsByEvent = false
+        let registration = MeetingCorrectionUndoRegistration()
+        let other = NativeUndoCounter()
+        manager.beginUndoGrouping()
+        manager.registerUndo(withTarget: other) { $0.calls += 1 }
+        manager.endUndoGrouping()
+        let sessionID = UUID()
+        var corrections = 0
+        let action: @MainActor () async -> Bool = { corrections += 1; return false }
+        registration.refresh(manager: manager, sessionID: sessionID, isEnabled: true, action: action)
+        registration.refresh(manager: manager, sessionID: sessionID, isEnabled: false, action: action)
+        manager.undo()
+        XCTAssertEqual(other.calls, 1, "native text undo remains available while editing")
+        XCTAssertEqual(corrections, 0)
+        registration.refresh(manager: manager, sessionID: sessionID, isEnabled: true, action: action)
+        registration.detach()
+        XCTAssertFalse(manager.canUndo, "leaving the transcript cannot undo an invisible meeting")
+    }
+
+    func testFailedSaveKeepsNativeUndoAvailableForRetry() async {
+        let manager = UndoManager()
+        manager.groupsByEvent = false
+        let registration = MeetingCorrectionUndoRegistration()
+        defer { registration.detach() }
+        let failed = self.expectation(description: "Failed save")
+        let retried = self.expectation(description: "Retried save")
+        var calls = 0
+        registration.refresh(manager: manager, sessionID: UUID(), isEnabled: true) {
+            calls += 1
+            if calls == 1 { failed.fulfill(); return true }
+            retried.fulfill()
+            return false
+        }
+        manager.undo()
+        await self.fulfillment(of: [failed], timeout: 2)
+        XCTAssertTrue(manager.canUndo)
+        manager.undo()
+        await self.fulfillment(of: [retried], timeout: 2)
+        XCTAssertEqual(calls, 2)
+        XCTAssertFalse(manager.canUndo)
+    }
+
+    func testPendingSaveCannotRegisterUndoInAnotherMeeting() async {
+        let manager = UndoManager()
+        manager.groupsByEvent = false
+        let registration = MeetingCorrectionUndoRegistration()
+        defer { registration.detach() }
+        let started = self.expectation(description: "First save started")
+        let finished = self.expectation(description: "First save finished")
+        let next = self.expectation(description: "Next meeting undone")
+        var continuation: CheckedContinuation<Bool, Never>?
+        registration.refresh(manager: manager, sessionID: UUID(), isEnabled: true) {
+            let result = await withCheckedContinuation { continuation = $0; started.fulfill() }
+            finished.fulfill()
+            return result
+        }
+        manager.undo()
+        await self.fulfillment(of: [started], timeout: 2)
+        registration.refresh(manager: manager, sessionID: UUID(), isEnabled: true) { next.fulfill(); return false }
+        continuation?.resume(returning: true)
+        await self.fulfillment(of: [finished], timeout: 2)
+        manager.undo()
+        await self.fulfillment(of: [next], timeout: 2)
+        XCTAssertFalse(manager.canUndo)
+    }
+}
+
+@MainActor
+private final class NativeUndoCounter {
+    var calls = 0
 }
 
 @MainActor
