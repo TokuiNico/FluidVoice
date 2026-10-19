@@ -144,7 +144,11 @@ final nonisolated class MeetingAudioChunkWriter: @unchecked Sendable {
     }
 
     @discardableResult
-    func enqueue(_ sampleBuffer: CMSampleBuffer, producerEpoch: UInt64 = 0) -> Bool {
+    func enqueue(
+        _ sampleBuffer: CMSampleBuffer,
+        producerEpoch: UInt64 = 0,
+        onConsumed: (@Sendable () -> Void)? = nil
+    ) -> Bool {
         self.stateLock.lock()
         guard self.lifecycle == .accepting else {
             self.stateLock.unlock()
@@ -168,6 +172,7 @@ final nonisolated class MeetingAudioChunkWriter: @unchecked Sendable {
         self.queue.async { [weak self, sampleBox] in
             defer { self?.pendingSlots.signal() }
             self?.consume(sampleBox.sampleBuffer, producerEpoch: sampleBox.producerEpoch)
+            onConsumed?()
         }
         self.stateLock.unlock()
         return true

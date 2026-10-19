@@ -20,6 +20,7 @@ nonisolated enum MeetingAECFailure: String, Error, Equatable, Sendable {
     case invalidDuration
     case unsupportedFormat
     case unsupportedSampleRate
+    case formatValidationTimedOut
     case formatChanged
     case nonFiniteSamples
     case streamChanged

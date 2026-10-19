@@ -188,6 +188,10 @@ final class MeetingSessionCoordinator: ObservableObject {
             movedSegments: [(id: MeetingTranscriptSegmentID, previousRevision: Int)]
         )
         case renameBatch([(speakerID: SessionSpeakerID, previousName: String)])
+        case speakerEdits(
+            previousSpeakers: [MeetingSessionSpeaker],
+            movedSegments: [(id: MeetingTranscriptSegmentID, speakerID: SessionSpeakerID?, revision: Int)]
+        )
     }
 
     private var correctionUndoStacks: [MeetingSessionID: [TranscriptCorrection]] = [:]
@@ -934,6 +938,28 @@ final class MeetingSessionCoordinator: ObservableObject {
     }
 
     @discardableResult
+    func editSpeakers(sessionID: MeetingSessionID, edits: MeetingSpeakerEdits) async throws -> MeetingSession {
+        try await self.performCorrection(sessionID: sessionID) { session in
+            let merges = try edits.resolvedMerges()
+            let previousSpeakers = session.speakers
+            let movedSegments: [(id: MeetingTranscriptSegmentID, speakerID: SessionSpeakerID?, revision: Int)] = session.transcriptSegments.compactMap { segment in
+                guard let speakerID = segment.speakerID, merges[speakerID] != nil else { return nil }
+                return (id: segment.id, speakerID: segment.speakerID, revision: segment.revision)
+            }
+            for source in merges.keys.sorted(by: { $0.uuidString < $1.uuidString }) {
+                if let target = merges[source] { try session.mergeSpeakers(source, into: target) }
+            }
+            for (speakerID, name) in edits.names {
+                guard session.speakers.contains(where: { $0.id == speakerID && $0.mergedIntoSpeakerID == nil }) else { continue }
+                let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { continue }
+                try session.renameSpeaker(id: speakerID, to: trimmed)
+            }
+            return .speakerEdits(previousSpeakers: previousSpeakers, movedSegments: movedSegments)
+        }
+    }
+
+    @discardableResult
     func reassignSegment(
         sessionID: MeetingSessionID,
         segmentID: MeetingTranscriptSegmentID,
@@ -1273,6 +1299,16 @@ final class MeetingSessionCoordinator: ObservableObject {
                 restored = true
             }
             return restored
+        case let .speakerEdits(previousSpeakers, movedSegments):
+            guard Set(session.speakers.map(\.id)) == Set(previousSpeakers.map(\.id)) else { return false }
+            let previous = Dictionary(uniqueKeysWithValues: movedSegments.map { ($0.id, $0) })
+            session.speakers = previousSpeakers
+            for index in session.transcriptSegments.indices {
+                guard let original = previous[session.transcriptSegments[index].id] else { continue }
+                session.transcriptSegments[index].speakerID = original.speakerID
+                session.transcriptSegments[index].revision = original.revision
+            }
+            return true
         }
     }
 
@@ -1762,6 +1798,18 @@ final class MeetingSessionCoordinator: ObservableObject {
     private func handleCaptureEvent(_ event: MeetingCaptureEvent, generation: UUID) {
         guard self.captureGeneration == generation, var session = self.activeSession else { return }
         switch event {
+        case let .microphoneEchoProtectionChanged(protection):
+            let kind: MeetingInterruptionKind = protection == .unfiltered ? .echoFilteringUnavailable : .echoFilteringRestored
+            if session.events.last(where: { $0.kind == .echoFilteringUnavailable || $0.kind == .echoFilteringRestored })?.kind == kind {
+                return
+            }
+            session.events.append(MeetingSessionEvent(
+                id: UUID(),
+                occurredAt: Date(),
+                kind: kind,
+                trackID: nil,
+                detail: protection.transcriptWarning
+            ))
         case let .trackHealth(trackID, health):
             if health.status == .healthy {
                 self.startupWriterFailures.remove(trackID)

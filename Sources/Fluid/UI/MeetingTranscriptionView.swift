@@ -305,8 +305,6 @@ struct MeetingTranscriptionView: View {
                         onReassignSegment: self.reassignSegment,
                         onEditTranscriptSegment: self.editTranscriptSegment,
                         onNameUnknownSegment: self.nameUnknownSegment,
-                        onRenameSpeaker: self.renameSpeaker,
-                        onMergeSpeakers: self.mergeSpeakers,
                         onUndoCorrection: self.undoTranscriptCorrection,
                         onRenameSession: self.renameMeetingSession,
                         onAssignSpeakers: self.assignSpeakers,
@@ -882,18 +880,6 @@ struct MeetingTranscriptionView: View {
         }
     }
 
-    private func renameSpeaker(sessionID: MeetingSessionID, speakerID: SessionSpeakerID, to displayName: String) {
-        self.actionErrorMessage = nil
-        Task {
-            do {
-                let saved = try await self.coordinator.renameSpeaker(sessionID: sessionID, speakerID: speakerID, to: displayName)
-                self.historySnapshot.applySavedSession(saved)
-            } catch {
-                self.actionErrorMessage = error.localizedDescription
-            }
-        }
-    }
-
     private func editTranscriptSegment(sessionID: MeetingSessionID, segmentID: MeetingTranscriptSegmentID, text: String, revision: Int) async -> String? {
         do {
             let saved = try await self.coordinator.editTranscriptText(sessionID: sessionID, segmentID: segmentID, text: text, expectedRevision: revision)
@@ -904,28 +890,16 @@ struct MeetingTranscriptionView: View {
         }
     }
 
-    private func assignSpeakers(sessionID: MeetingSessionID, names: [SessionSpeakerID: String]) async -> String? {
+    private func assignSpeakers(sessionID: MeetingSessionID, edits: MeetingSpeakerEdits) async -> String? {
         self.actionErrorMessage = nil
         var errorMessage: String?
         do {
-            let saved = try await self.coordinator.renameSpeakers(sessionID: sessionID, names: names)
+            let saved = try await self.coordinator.editSpeakers(sessionID: sessionID, edits: edits)
             self.historySnapshot.applySavedSession(saved)
         } catch {
             errorMessage = error.localizedDescription
         }
         return errorMessage
-    }
-
-    private func mergeSpeakers(sessionID: MeetingSessionID, source: SessionSpeakerID, into targetID: SessionSpeakerID) {
-        self.actionErrorMessage = nil
-        Task {
-            do {
-                let saved = try await self.coordinator.mergeSpeakers(sessionID: sessionID, source: source, into: targetID)
-                self.historySnapshot.applySavedSession(saved)
-            } catch {
-                self.actionErrorMessage = error.localizedDescription
-            }
-        }
     }
 
     private func renameMeetingSession(sessionID: MeetingSessionID, to title: String) {
@@ -1455,11 +1429,9 @@ struct MeetingTranscriptionCanvas: View {
     let onReassignSegment: (MeetingSessionID, MeetingTranscriptSegmentID, SessionSpeakerID) -> Void
     var onEditTranscriptSegment: (MeetingSessionID, MeetingTranscriptSegmentID, String, Int) async -> String? = { _, _, _, _ in "Transcript editing is unavailable." }
     let onNameUnknownSegment: (MeetingSessionID, MeetingTranscriptSegmentID, String) -> Void
-    let onRenameSpeaker: (MeetingSessionID, SessionSpeakerID, String) -> Void
-    let onMergeSpeakers: (MeetingSessionID, SessionSpeakerID, SessionSpeakerID) -> Void
     let onUndoCorrection: (MeetingSessionID) async -> Bool
     let onRenameSession: (MeetingSessionID, String) -> Void
-    let onAssignSpeakers: (MeetingSessionID, [SessionSpeakerID: String]) async -> String?
+    let onAssignSpeakers: (MeetingSessionID, MeetingSpeakerEdits) async -> String?
     let canUndoCorrection: (MeetingSessionID) -> Bool
     let isQuiescent: Bool
     let onRepairSetup: () -> Void
@@ -1558,12 +1530,6 @@ struct MeetingTranscriptionCanvas: View {
                         },
                         onNameUnknownSegment: { segmentID, name in
                             self.onNameUnknownSegment(session.id, segmentID, name)
-                        },
-                        onRenameSpeaker: { speakerID, name in
-                            self.onRenameSpeaker(session.id, speakerID, name)
-                        },
-                        onMergeSpeakers: { source, target in
-                            self.onMergeSpeakers(session.id, source, target)
                         },
                         onUndo: { await self.onUndoCorrection(session.id) },
                         onRenameSession: { title in self.onRenameSession(session.id, title) },

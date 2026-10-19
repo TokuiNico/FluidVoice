@@ -51,6 +51,13 @@ struct MeetingRecordingCanvas: View {
                 Divider()
             }
 
+            if let warning = self.session.microphoneEchoWarning {
+                MeetingAudioTranscriptNotice(
+                    text: "Some audio may have an echo.",
+                    detail: warning,
+                    isSubtle: true
+                )
+            }
             MeetingLiveTranscriptCard(snapshot: self.liveTranscript)
 
             Divider()
@@ -350,11 +357,9 @@ struct MeetingResultCanvas: View {
     let onReassignSegment: (MeetingTranscriptSegmentID, SessionSpeakerID) -> Void
     var onEditTranscriptSegment: (MeetingTranscriptSegmentID, String, Int) async -> String? = { _, _, _ in "Transcript editing is unavailable." }
     let onNameUnknownSegment: (MeetingTranscriptSegmentID, String) -> Void
-    let onRenameSpeaker: (SessionSpeakerID, String) -> Void
-    let onMergeSpeakers: (SessionSpeakerID, SessionSpeakerID) -> Void
     let onUndo: () async -> Bool
     let onRenameSession: (String) -> Void
-    let onAssignSpeakers: ([SessionSpeakerID: String]) async -> String?
+    let onAssignSpeakers: (MeetingSpeakerEdits) async -> String?
     let onClose: (() -> Void)?
     /// Opens FluidMeet settings on Integrations, so adding an agent is one step from any meeting.
     var onOpenIntegrations: (() -> Void)? = nil
@@ -363,8 +368,6 @@ struct MeetingResultCanvas: View {
     @Environment(\.undoManager) private var undoManager
     @StateObject private var correctionUndo = MeetingCorrectionUndoRegistration()
     @State private var pendingEditedSegment: MeetingTranscriptSegment?
-    @State private var pendingRenameSpeaker: MeetingSessionSpeaker?
-    @State private var pendingRenameText = ""
     @State private var pendingNameUnknownSegmentID: MeetingTranscriptSegmentID?
     @State private var pendingUnknownSpeakerName = ""
     @State private var isRenamingSession = false
@@ -443,6 +446,15 @@ struct MeetingResultCanvas: View {
                     MeetingSummaryView(session: self.session, isQuiescent: self.isQuiescent)
                         .id("\(self.session.id)-\(self.session.updatedAt)")
                 } else {
+                    if let warning = self.session.microphoneEchoWarning {
+                        MeetingAudioTranscriptNotice(
+                            text: "Some audio may have an echo.",
+                            detail: warning,
+                            isSubtle: true
+                        )
+                    } else if self.session.events.contains(where: { $0.kind == .transcriptCoverageIncomplete }) {
+                        MeetingAudioTranscriptNotice(text: "Some recorded audio was not transcribed.")
+                    }
                     if !activeSpeakers.isEmpty {
                         VStack(alignment: .leading, spacing: self.theme.metrics.spacing.sm) {
                             self.speakerStrip(activeSpeakers)
@@ -542,24 +554,6 @@ struct MeetingResultCanvas: View {
             guard self.copied else { return }
             do { try await Task.sleep(for: .seconds(2)) } catch { return }
             self.copied = false
-        }
-        .alert(
-            "Rename Speaker",
-            isPresented: Binding(
-                get: { self.pendingRenameSpeaker != nil },
-                set: { if !$0 { self.pendingRenameSpeaker = nil } }
-            )
-        ) {
-            TextField("Speaker name", text: self.$pendingRenameText)
-            Button("Cancel", role: .cancel) { self.pendingRenameSpeaker = nil }
-            Button("Rename") {
-                if let speaker = self.pendingRenameSpeaker {
-                    self.onRenameSpeaker(speaker.id, self.pendingRenameText)
-                }
-                self.pendingRenameSpeaker = nil
-            }
-        } message: {
-            Text("Enter a new name for this speaker.")
         }
         .alert(
             "Name Unknown Speaker",
@@ -665,10 +659,18 @@ struct MeetingResultCanvas: View {
     }
 
     private func speakerStrip(_ speakers: [MeetingSessionSpeaker]) -> some View {
-        HStack(spacing: self.theme.metrics.spacing.md) {
-            Text("Speakers")
-                .font(self.theme.typography.caption)
-                .foregroundStyle(self.theme.palette.tertiaryText)
+        VStack(alignment: .leading, spacing: self.theme.metrics.spacing.sm) {
+            HStack(spacing: self.theme.metrics.spacing.sm) {
+                Text("Speakers")
+                    .font(self.theme.typography.caption)
+                    .foregroundStyle(self.theme.palette.tertiaryText)
+                Spacer(minLength: 0)
+                Button("Edit speakers", systemImage: "pencil") {
+                    self.presentAssignSpeakers(focusing: nil)
+                }
+                .fluidGlassAction()
+                .disabled(!self.isQuiescent)
+            }
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: self.theme.metrics.spacing.lg) {
                     ForEach(speakers) { speaker in
@@ -680,7 +682,6 @@ struct MeetingResultCanvas: View {
                             action: { self.presentAssignSpeakers(focusing: speaker.id) }
                         )
                         .disabled(!self.isQuiescent)
-                        .contextMenu { self.speakerChipMenu(for: speaker) }
                     }
                 }
                 .padding(.vertical, self.theme.metrics.spacing.xs)
@@ -741,7 +742,7 @@ struct MeetingResultCanvas: View {
 
     private var canRegisterUndo: Bool {
         self.canUndo && self.isQuiescent && self.documentSection == .transcript
-            && self.pendingEditedSegment == nil && self.pendingRenameSpeaker == nil
+            && self.pendingEditedSegment == nil
             && self.pendingNameUnknownSegmentID == nil && !self.isRenamingSession
             && !self.isShowingAssignSpeakers
     }
@@ -753,30 +754,6 @@ struct MeetingResultCanvas: View {
             isEnabled: self.canRegisterUndo,
             action: self.onUndo
         )
-    }
-
-    @ViewBuilder
-    private func speakerChipMenu(for speaker: MeetingSessionSpeaker) -> some View {
-        Button("Rename…", systemImage: "pencil") {
-            self.pendingRenameSpeaker = speaker
-            self.pendingRenameText = speaker.displayName
-        }
-        .disabled(!self.isQuiescent)
-        if !speaker.isLocalUser {
-            let eligibleTargets = self.session.activeSpeakers.filter {
-                $0.id != speaker.id && !$0.isLocalUser && $0.trackKind == speaker.trackKind
-            }
-            if !eligibleTargets.isEmpty {
-                Menu("Merge into") {
-                    ForEach(eligibleTargets) { target in
-                        Button(target.displayName) {
-                            self.onMergeSpeakers(speaker.id, target.id)
-                        }
-                    }
-                }
-                .disabled(!self.isQuiescent)
-            }
-        }
     }
 
     private func displayName(for speaker: MeetingSessionSpeaker) -> String {
@@ -989,6 +966,21 @@ struct MeetingFailureCanvas: View {
     }
 }
 
+private struct MeetingAudioTranscriptNotice: View {
+    let text: String
+    var detail: String? = nil
+    var isSubtle = false
+    @Environment(\.theme) private var theme
+
+    var body: some View {
+        Label(self.text, systemImage: self.isSubtle ? "info.circle" : "exclamationmark.triangle")
+            .font(self.theme.typography.caption)
+            .foregroundStyle(self.isSubtle ? self.theme.palette.secondaryText : self.theme.palette.warning)
+            .fixedSize(horizontal: false, vertical: true)
+            .help(self.detail ?? self.text)
+    }
+}
+
 private struct MeetingTrackHealthRow: View {
     let title: String
     let systemImage: String
@@ -1170,15 +1162,14 @@ private struct MeetingTranscriptSegmentRow: View {
             Button("Edit text", systemImage: "pencil") { self.beginEditing() }
                 .disabled(!self.isQuiescent || self.isEditingText)
             if self.segment.speakerID == nil {
-                Menu("Assign speaker") {
-                    ForEach(self.reassignTargets) { target in
-                        Button(target.displayName) {
-                            self.playback.stop()
-                            self.onReassign(target.id)
-                        }
+                Divider()
+                ForEach(self.reassignTargets) { target in
+                    Button("Assign to \(target.displayName)") {
+                        self.playback.stop()
+                        self.onReassign(target.id)
                     }
+                    .disabled(!self.isQuiescent)
                 }
-                .disabled(!self.isQuiescent || self.reassignTargets.isEmpty)
             }
         }
         .accessibilityElement(children: .contain)

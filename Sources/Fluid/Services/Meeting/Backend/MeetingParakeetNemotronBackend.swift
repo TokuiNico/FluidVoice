@@ -13,7 +13,7 @@ import Foundation
 final class MeetingParakeetNemotronBackend: MeetingTranscriptionBackend {
     static let descriptor = MeetingBackendDescriptor(
         id: .parakeetNemotron,
-        version: "7",
+        version: "8",
         execution: .local,
         supportedLanguageCodes: VoiceEngineLanguageCatalog.parakeetV3LanguageIDs,
         supportedTrackKinds: Set(MeetingAudioTrackKind.allCases),
