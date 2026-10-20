@@ -23,51 +23,166 @@ final class CustomDictionaryManualEntryTests: XCTestCase {
         super.tearDown()
     }
 
-    func testIncompletePronunciationNoticeRendersWithoutRecordingOrSaving() async throws {
+    func testTrainingRestartWaitsBeforeStartingAndClearsWaitingState() async {
+        let restart = DictionaryTrainingRestart()
+        let started = expectation(description: "Next example starts after the break")
+        var calls = 0
+        let notBefore = ContinuousClock.now.advanced(by: .milliseconds(80))
+        restart.schedule(delay: .milliseconds(80), canContinue: { true }) {
+            XCTAssertGreaterThanOrEqual(ContinuousClock.now, notBefore)
+            calls += 1
+            started.fulfill()
+        }
+        XCTAssertTrue(restart.isWaiting)
+        XCTAssertEqual(calls, 0)
+        await fulfillment(of: [started], timeout: 1)
+        XCTAssertEqual(calls, 1)
+        XCTAssertFalse(restart.isWaiting)
+    }
+
+    func testCancelledAndSupersededTrainingRestartsCannotStartCapture() async {
+        let restart = DictionaryTrainingRestart()
+        let stale = expectation(description: "Cancelled examples cannot restart")
+        stale.isInverted = true
+        for _ in 0..<10 {
+            restart.schedule(delay: .milliseconds(30), canContinue: { true }) { stale.fulfill() }
+        }
+        restart.cancel()
+        XCTAssertFalse(restart.isWaiting)
+        let current = expectation(description: "Only the current example starts")
+        restart.schedule(delay: .milliseconds(20), canContinue: { true }) { current.fulfill() }
+        await fulfillment(of: [current, stale], timeout: 0.15)
+        XCTAssertFalse(restart.isWaiting)
+    }
+
+    func testTrainingRestartRechecksWhetherThePageStillWantsCapture() async {
+        let restart = DictionaryTrainingRestart()
+        var canContinue = true
+        let stopped = expectation(description: "Changed word cannot restart the old capture")
+        stopped.isInverted = true
+        restart.schedule(delay: .milliseconds(20), canContinue: { canContinue }) { stopped.fulfill() }
+        canContinue = false
+        await fulfillment(of: [stopped], timeout: 0.1)
+        XCTAssertFalse(restart.isWaiting)
+    }
+
+    func testSplitWordsRemainValidVoiceTrainingCorrections() async {
+        let result = await VoiceTrainingAliasFilter.filter(["fluid voice", "john turner", "there", "the"])
+        XCTAssertEqual(result.accepted, ["fluid voice", "john turner"])
+        XCTAssertEqual(result.rejected, ["there", "the"])
+    }
+
+    func testOnlyExplicitManualSpellingsBypassTheBasicWordGuard() async {
+        let result = await VoiceTrainingAliasFilter.filter(["the", "and", "fluid voice"], manuallyConfirmed: ["the", "absent"])
+        XCTAssertEqual(result.accepted, ["the", "fluid voice"])
+        XCTAssertEqual(result.rejected, ["and"])
+        let invalid = await VoiceTrainingAliasFilter.filter(["", String(repeating: "x", count: 161)], manuallyConfirmed: ["", String(repeating: "x", count: 161)])
+        XCTAssertTrue(invalid.accepted.isEmpty)
+    }
+
+    func testTrainingPauseAndVisibleSpellingsRenderWithoutInvokingActions() async throws {
+        let entries = SettingsStore.shared.customDictionaryEntries
         var actions = 0
-        for width in [420.0, 760.0] {
-            for scheme in [ColorScheme.light, .dark] {
-                let progress = DictionaryTrainingProgress(spellingCount: 3, pronunciationCount: 1, pronunciationEnabled: true)
-                let view = DictionaryWordWizard(
-                    word: .constant("Palermo"),
-                    step: .review,
-                    count: 3,
-                    heard: "pal ermo",
-                    variants: ["pal ermo"],
-                    busy: false,
-                    recording: false,
-                    processing: false,
-                    starting: false,
-                    error: nil,
-                    voiceSupported: true,
-                    alreadyCorrect: false,
-                    savedWord: "",
-                    onContinue: { actions += 1 },
-                    onRecord: { actions += 1 },
-                    onSave: { actions += 1 },
-                    onBack: { actions += 1 },
-                    onNewWord: { actions += 1 },
-                    onManual: { actions += 1 },
-                    onPracticeMore: { actions += 1 },
-                    pronunciationNotice: progress.pronunciationNotice,
-                    pronunciationIncomplete: true
-                )
-                .padding(20).frame(width: width)
-                .background(scheme == .dark ? Color(white: 0.12) : Color(white: 0.96))
-                .appTheme(.adaptive(accent: FluidBrandColors.blue, colorScheme: scheme))
-                .environment(\.colorScheme, scheme)
-                let host = NSHostingView(rootView: view)
-                let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: width, height: 1050), styleMask: [.titled], backing: .buffered, defer: false)
-                window.contentView = host
-                window.appearance = NSAppearance(named: scheme == .dark ? .darkAqua : .aqua)
-                window.orderFrontRegardless()
-                try await Task.sleep(for: .milliseconds(150))
-                host.layoutSubtreeIfNeeded()
-                let bitmap = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
-                host.cacheDisplay(in: host.bounds, to: bitmap)
-                let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
-                try png.write(to: URL(fileURLWithPath: "/tmp/dictionary-wizard-review-\(Int(width))-\(scheme).png"))
-                window.orderOut(nil)
+        for phase in ["starting", "listening", "processing", "waiting"] {
+            for width in [420.0, 900.0] {
+                for scheme in [ColorScheme.light, .dark] {
+                    let view = DictionaryWordWizard(
+                        word: .constant(width < 500 ? "Supercalifragilisticexpialidocious" : "FluidVoice"),
+                        step: .recording,
+                        count: 1,
+                        heard: "fluid voice",
+                        variants: ["fluid voice", "fluid boys"],
+                        busy: phase != "listening",
+                        recording: phase == "listening" || phase == "starting",
+                        processing: phase == "processing",
+                        starting: phase == "starting",
+                        error: nil,
+                        voiceSupported: true,
+                        alreadyCorrect: false,
+                        savedWord: "",
+                        onContinue: { actions += 1 },
+                        onRecord: { actions += 1 },
+                        onSave: { actions += 1 },
+                        onBack: { actions += 1 },
+                        onNewWord: { actions += 1 },
+                        onManual: { actions += 1 },
+                        onPracticeMore: { actions += 1 },
+                        automaticCaptureActive: true,
+                        waiting: phase == "waiting",
+                        onPauseRecording: { actions += 1 },
+                        onAddSpelling: { _ in actions += 1; return nil },
+                        onRemoveSpelling: { _ in actions += 1 }
+                    )
+                    .padding(20).frame(width: width)
+                    .background(scheme == .dark ? Color(white: 0.12) : Color(white: 0.96))
+                    .appTheme(.adaptive(accent: FluidBrandColors.blue, colorScheme: scheme))
+                    .environment(\.colorScheme, scheme)
+                    let host = NSHostingView(rootView: view)
+                    let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: width, height: 1100), styleMask: [.titled], backing: .buffered, defer: false)
+                    window.contentView = host
+                    window.appearance = NSAppearance(named: scheme == .dark ? .darkAqua : .aqua)
+                    window.orderFrontRegardless()
+                    try await Task.sleep(for: .milliseconds(100))
+                    host.layoutSubtreeIfNeeded()
+                    let bitmap = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+                    host.cacheDisplay(in: host.bounds, to: bitmap)
+                    let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+                    try png.write(to: URL(fileURLWithPath: "/tmp/dictionary-recording-\(phase)-\(Int(width))-\(scheme).png"))
+                    window.orderOut(nil)
+                }
+            }
+        }
+        XCTAssertEqual(actions, 0)
+        XCTAssertEqual(SettingsStore.shared.customDictionaryEntries, entries)
+    }
+
+    func testReviewStatesRenderWithoutRecordingOrSaving() async throws {
+        var actions = 0
+        for pronunciationCount in [1, 3] {
+            for width in [420.0, 760.0] {
+                for scheme in [ColorScheme.light, .dark] {
+                    let progress = DictionaryTrainingProgress(spellingCount: 3, pronunciationCount: pronunciationCount, pronunciationEnabled: true)
+                    let view = DictionaryWordWizard(
+                        word: .constant("Palermo"),
+                        step: .review,
+                        count: 3,
+                        heard: "pal ermo",
+                        variants: ["pal ermo"],
+                        busy: false,
+                        recording: false,
+                        processing: false,
+                        starting: false,
+                        error: nil,
+                        voiceSupported: true,
+                        alreadyCorrect: false,
+                        savedWord: "",
+                        onContinue: { actions += 1 },
+                        onRecord: { actions += 1 },
+                        onSave: { actions += 1 },
+                        onBack: { actions += 1 },
+                        onNewWord: { actions += 1 },
+                        onManual: { actions += 1 },
+                        onPracticeMore: { actions += 1 },
+                        pronunciationNotice: progress.pronunciationNotice,
+                        pronunciationIncomplete: !progress.pronunciationReady
+                    )
+                    .padding(20).frame(width: width)
+                    .background(scheme == .dark ? Color(white: 0.12) : Color(white: 0.96))
+                    .appTheme(.adaptive(accent: FluidBrandColors.blue, colorScheme: scheme))
+                    .environment(\.colorScheme, scheme)
+                    let host = NSHostingView(rootView: view)
+                    let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: width, height: 1050), styleMask: [.titled], backing: .buffered, defer: false)
+                    window.contentView = host
+                    window.appearance = NSAppearance(named: scheme == .dark ? .darkAqua : .aqua)
+                    window.orderFrontRegardless()
+                    try await Task.sleep(for: .milliseconds(150))
+                    host.layoutSubtreeIfNeeded()
+                    let bitmap = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+                    host.cacheDisplay(in: host.bounds, to: bitmap)
+                    let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+                    try png.write(to: URL(fileURLWithPath: "/tmp/dictionary-wizard-review-\(pronunciationCount)-\(Int(width))-\(scheme).png"))
+                    window.orderOut(nil)
+                }
             }
         }
         XCTAssertEqual(actions, 0)

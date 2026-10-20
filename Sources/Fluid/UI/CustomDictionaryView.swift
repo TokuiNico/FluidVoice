@@ -9,6 +9,7 @@
 //
 
 import AppKit
+import Combine
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -51,11 +52,13 @@ struct CustomDictionaryView: View {
     @State private var trainingReplacement = ""
     @State private var trainingSaveID: UUID?
     @State private var trainingVariants: [String] = []
+    @State private var manualTrainingSpellings = Set<String>()
     @AppStorage("DictionarySharedFeatureMatcherEnabled") private var pronunciationEnabled = false
     @State private var pronunciationMatchingEnabled = SettingsStore.shared.pronunciationMatchingEnabled
     @State private var trainingPronunciationEnrollments: [PronunciationEnrollmentCapture] = []
     @State private var trainingSampleCount = 0
     @State private var lastTrainingOutput = ""
+    @State private var trainingAttempts: [String] = []
     @State private var lastTrainingOutputIsCovered = false
     @State private var consecutiveCoveredCaptures = 0
     @State private var trainingStatusMessage = "Type the correct text."
@@ -66,6 +69,7 @@ struct CustomDictionaryView: View {
     @State private var trainingStopRequestedDuringStart = false
     @State private var isTrainingProcessing = false
     @State private var isAutomaticTrainingEnabled = false
+    @StateObject private var trainingRestart = DictionaryTrainingRestart()
     @State private var isTrainedReplacementButtonHovered = false
     @State private var isTrainedReplacementGlowExpanded = false
     @State private var replacementConfirmation: ReplacementConfirmation?
@@ -354,7 +358,7 @@ struct CustomDictionaryView: View {
             EditDictionaryEntrySheet(
                 entry: entry,
                 existingTriggers: self.allExistingTriggers(excluding: entry.id),
-                isCaptureBusy: self.asr.isRunning || self.isTrainingStarting || self.isTrainingRecording || self.isTrainingProcessing
+                isCaptureBusy: self.asr.isRunning || self.isTrainingStarting || self.isTrainingRecording || self.isTrainingProcessing || self.isAutomaticTrainingEnabled
             ) { updatedEntry in
                 if let index = self.entries.firstIndex(where: { $0.id == updatedEntry.id }) {
                     self.entries[index] = updatedEntry
@@ -393,8 +397,19 @@ struct CustomDictionaryView: View {
             guard !self.formattingOnly else { return }
             self.pronunciationRevisionNoticeRefresh &+= 1
         }
+        .onReceive(self.asr.$isDictionaryTrainingCaptureActive.removeDuplicates().dropFirst()) { active in
+            guard !self.formattingOnly, !active else { return }
+            self.handleTrainingCaptureEndedElsewhere()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in
+            guard self.trainingRestart.isWaiting else { return }
+            self.trainingRestart.cancel()
+            self.isAutomaticTrainingEnabled = false
+        }
         .onChange(of: self.pronunciationEnabled) { _, enabled in
             guard !enabled else { return }
+            self.trainingRestart.cancel()
+            self.isAutomaticTrainingEnabled = false
             self.trainingPronunciationEnrollments = []
             if self.trainingSaveID != nil {
                 self.trainingSaveID = nil
@@ -405,6 +420,7 @@ struct CustomDictionaryView: View {
         }
         .onDisappear {
             guard !self.formattingOnly else { return }
+            self.trainingRestart.cancel()
             if self.trainingSaveID != nil {
                 self.trainingSaveID = nil
                 self.isTrainingProcessing = false
@@ -618,7 +634,7 @@ struct CustomDictionaryView: View {
                     count: self.trainingSampleCount,
                     heard: self.lastTrainingOutput,
                     variants: self.trainingVariants,
-                    busy: self.isTrainingRecording || self.isTrainingProcessing || self.isTrainingStarting,
+                    busy: self.isTrainingRecording || self.isTrainingProcessing || self.isTrainingStarting || self.trainingRestart.isWaiting,
                     recording: self.isTrainingRecording,
                     processing: self.isTrainingProcessing || self.isTrainingStarting,
                     starting: self.isTrainingStarting,
@@ -632,7 +648,7 @@ struct CustomDictionaryView: View {
                     },
                     onRecord: {
                         self.wizardStep = .recording
-                        Task { await self.toggleAutomaticTraining() }
+                        Task { await self.startAutomaticTrainingIfIdle() }
                     },
                     onSave: {
                         if self.trainingAlreadyCorrectWithoutReplacement {
@@ -665,9 +681,15 @@ struct CustomDictionaryView: View {
                     },
                     wordFocusRequest: self.newWordFocusRequest,
                     automaticCaptureActive: self.isAutomaticTrainingEnabled,
+                    waiting: self.trainingRestart.isWaiting,
+                    canSave: self.canAddTrainedReplacement || self.trainingAlreadyCorrectWithoutReplacement,
+                    onPauseRecording: { Task { await self.pauseAutomaticTraining() } },
+                    onAddSpelling: self.addManualTrainingSpelling,
+                    onRemoveSpelling: self.removeTrainingVariant,
                     audioLevels: self.asr.audioLevelPublisher,
                     pronunciationNotice: self.trainingProgress.pronunciationNotice,
-                    pronunciationIncomplete: self.activePronunciationMatching && !self.trainingProgress.pronunciationReady
+                    pronunciationIncomplete: self.activePronunciationMatching && !self.trainingProgress.pronunciationReady,
+                    attempts: self.trainingAttempts
                 )
                 .onChange(of: self.trainingReplacement) { oldValue, newValue in
                     self.handleTrainingReplacementChange(oldValue: oldValue, newValue: newValue)
@@ -2268,13 +2290,24 @@ struct CustomDictionaryView: View {
 
     private func toggleAutomaticTraining() async {
         if self.isAutomaticTrainingEnabled {
-            self.isAutomaticTrainingEnabled = false
-            if self.isTrainingRecording {
-                await self.stopTrainingSample()
-            }
+            await self.pauseAutomaticTraining()
             return
         }
+        await self.startAutomaticTrainingIfIdle()
+    }
 
+    private func pauseAutomaticTraining() async {
+        self.trainingRestart.cancel()
+        self.isAutomaticTrainingEnabled = false
+        if self.isTrainingRecording {
+            await self.stopTrainingSample()
+        }
+    }
+
+    private func startAutomaticTrainingIfIdle() async {
+        guard !self.isAutomaticTrainingEnabled, !self.isTrainingStarting,
+              !self.isTrainingRecording, !self.isTrainingProcessing, !self.trainingRestart.isWaiting
+        else { return }
         if self.canRetryTrainingAfterMaximum {
             self.resetTrainingVerificationAttempts()
         }
@@ -2330,6 +2363,20 @@ struct CustomDictionaryView: View {
         await self.finishTrainingSampleStop()
     }
 
+    /// Our own stop clears `isTrainingRecording` before the recorder stops, so reaching here with it
+    /// still set means something else ended the capture, such as Escape. Leave the screen idle.
+    private func handleTrainingCaptureEndedElsewhere() {
+        guard self.isTrainingRecording, !self.isTrainingStarting, !self.isTrainingProcessing else { return }
+        DictionaryTrainingEndpointMonitor.shared.stop()
+        self.trainingRestart.cancel()
+        self.isAutomaticTrainingEnabled = false
+        self.isTrainingRecording = false
+        self.trainingStopRequestedDuringStart = false
+        self.trainingHasError = true
+        self.trainingStatusMessage = "Recording stopped. Press Record to continue."
+        DebugLogger.shared.info("DICTIONARY_TRAINING capture ended outside the editor; returning to idle", source: "CustomDictionary")
+    }
+
     private func handleAutomaticTrainingSpeechEnd() {
         guard self.isAutomaticTrainingEnabled, self.isTrainingRecording else { return }
         Task { await self.stopTrainingSample() }
@@ -2370,25 +2417,35 @@ struct CustomDictionaryView: View {
             self.isAutomaticTrainingEnabled = false
             self.wizardStep = .review
         }
-        await self.continueAutomaticTrainingIfNeeded()
+        self.continueAutomaticTrainingIfNeeded()
     }
 
-    private func continueAutomaticTrainingIfNeeded() async {
-        guard self.isAutomaticTrainingEnabled,
-              !self.trainingFinalOutputIsReady,
-              !self.trainingAlreadyCorrectWithoutReplacement,
-              self.trainingSampleCount < CustomDictionaryTrainingMerge.maxSamples
-        else {
+    private var canContinueAutomaticTraining: Bool {
+        NSApp.isActive && self.isAutomaticTrainingEnabled && !self.trainingFinalOutputIsReady &&
+            !self.trainingAlreadyCorrectWithoutReplacement &&
+            self.trainingSampleCount < CustomDictionaryTrainingMerge.maxSamples
+    }
+
+    private func continueAutomaticTrainingIfNeeded() {
+        guard self.canContinueAutomaticTraining else {
+            self.trainingRestart.cancel()
             self.isAutomaticTrainingEnabled = false
             return
         }
-
-        await Task.yield()
-        await self.startTrainingSample()
+        self.trainingRestart.schedule(canContinue: {
+            guard self.canContinueAutomaticTraining else {
+                self.isAutomaticTrainingEnabled = false
+                return false
+            }
+            return true
+        }) {
+            await self.startTrainingSample()
+        }
     }
 
     private func resetTrainingVerificationAttempts() {
         self.trainingSampleCount = 0
+        self.trainingAttempts = []
         self.lastTrainingOutput = ""
         self.lastTrainingOutputIsCovered = false
         self.consecutiveCoveredCaptures = 0
@@ -2408,6 +2465,7 @@ struct CustomDictionaryView: View {
 
         self.lastTrainingOutput = detected
         self.trainingSampleCount = min(self.trainingSampleCount + 1, CustomDictionaryTrainingMerge.maxSamples)
+        self.trainingAttempts = Array((self.trainingAttempts + [detected]).suffix(CustomDictionaryTrainingMerge.maxSamples))
 
         if detected.caseInsensitiveCompare(self.normalizedTrainingReplacement) == .orderedSame {
             self.lastTrainingOutputIsCovered = true
@@ -2474,7 +2532,7 @@ struct CustomDictionaryView: View {
         let enrollments = self.trainingPronunciationEnrollments
         let savePronunciation = self.trainingProgress.pronunciationReady
         let pronunciationGeneration = DictionaryMatcherExperiment.generation
-        let filtered = await VoiceTrainingAliasFilter.filter(self.trainingVariants)
+        let filtered = await VoiceTrainingAliasFilter.filter(self.trainingVariants, manuallyConfirmed: self.manualTrainingSpellings)
         guard self.trainingSaveID == saveID, !Task.isCancelled else { return }
         DebugLogger.shared.info(
             "VOICE_TRAINING_ALIAS_FILTER accepted=\(filtered.accepted.count) rejected=\(filtered.rejected.count)",
@@ -2539,8 +2597,24 @@ struct CustomDictionaryView: View {
     }
 
     private func removeTrainingVariant(_ variant: String) {
+        guard !self.isManualEntryBlocked else { return }
         self.trainingVariants.removeAll { $0 == variant }
+        self.manualTrainingSpellings.remove(variant)
         self.refreshLastTrainingCoverage()
+    }
+
+    private func addManualTrainingSpelling(_ spelling: String) -> String? {
+        guard !self.isManualEntryBlocked else { return "Pause learning before editing spellings." }
+        guard self.trainingVariants.count < CustomDictionaryTrainingMerge.maxSamples else { return "Remove a spelling before adding another." }
+        guard let normalized = CustomDictionaryTrainingMerge.normalizedTrigger(spelling) else { return "Enter the spelling FluidVoice gets wrong." }
+        guard normalized.count <= 160 else { return "Use 160 characters or fewer." }
+        guard normalized.caseInsensitiveCompare(self.normalizedTrainingReplacement) != .orderedSame else { return "That is already the correct spelling." }
+        guard !self.trainingVariants.contains(where: { $0.caseInsensitiveCompare(normalized) == .orderedSame }) else { return "That spelling is already in this list." }
+        guard !self.allExistingTriggers().contains(normalized) else { return "That spelling already belongs to a saved word." }
+        self.trainingVariants.append(normalized)
+        self.manualTrainingSpellings.insert(normalized)
+        self.refreshLastTrainingCoverage()
+        return nil
     }
 
     private func refreshLastTrainingCoverage() {
@@ -2584,13 +2658,16 @@ struct CustomDictionaryView: View {
     }
 
     private func resetTraining(statusMessage: String = "Type the correct text.", keepingWord: Bool = false) {
+        self.trainingRestart.cancel()
         self.trainingSaveID = nil
         self.isAutomaticTrainingEnabled = false
         DictionaryTrainingEndpointMonitor.shared.stop()
         if !keepingWord { self.trainingReplacement = "" }
         self.trainingVariants = []
+        self.manualTrainingSpellings = []
         self.trainingPronunciationEnrollments = []
         self.trainingSampleCount = 0
+        self.trainingAttempts = []
         self.lastTrainingOutput = ""
         self.lastTrainingOutputIsCovered = false
         self.consecutiveCoveredCaptures = 0
@@ -2607,6 +2684,8 @@ struct CustomDictionaryView: View {
         let oldKey = CustomDictionaryTrainingMerge.normalizedReplacement(oldValue).lowercased()
         let newKey = CustomDictionaryTrainingMerge.normalizedReplacement(newValue).lowercased()
         guard oldKey != newKey else { return }
+        self.trainingRestart.cancel()
+        self.isAutomaticTrainingEnabled = false
 
         if self.trainingSaveID != nil {
             self.trainingSaveID = nil
@@ -2614,8 +2693,10 @@ struct CustomDictionaryView: View {
         }
 
         self.trainingVariants = self.existingTrainingVariants(for: newValue)
+        self.manualTrainingSpellings = []
         self.trainingPronunciationEnrollments = []
         self.trainingSampleCount = 0
+        self.trainingAttempts = []
         self.lastTrainingOutput = ""
         self.lastTrainingOutputIsCovered = false
         self.consecutiveCoveredCaptures = 0
@@ -2853,10 +2934,12 @@ private extension CustomDictionaryView {
     }
 
     func handlePronunciationMatchingChange(enabled: Bool) {
+        self.trainingRestart.cancel()
         SettingsStore.shared.pronunciationMatchingEnabled = enabled
         self.isAutomaticTrainingEnabled = false
         DictionaryTrainingEndpointMonitor.shared.stop()
         self.trainingVariants = self.existingTrainingVariants(for: self.trainingReplacement)
+        self.manualTrainingSpellings = []
         self.trainingPronunciationEnrollments = []
         self.resetTrainingVerificationAttempts()
         self.trainingStatusMessage = self.normalizedTrainingReplacement.isEmpty

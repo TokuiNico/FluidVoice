@@ -764,27 +764,13 @@ extension DictationE2ETests {
         XCTAssertEqual(SettingsStore.shared.customDictionaryEntries, entries)
     }
 
-    func testDictionaryRingAudioResponseIsBoundedAndGeometryStaysInsideItsFrame() {
-        XCTAssertEqual(DictionaryRingResponse.energy(for: 0), 0)
-        XCTAssertEqual(DictionaryRingResponse.energy(for: -1), 0)
-        XCTAssertEqual(DictionaryRingResponse.energy(for: .nan), 0)
-        XCTAssertEqual(DictionaryRingResponse.energy(for: .infinity), 0)
-        XCTAssertEqual(DictionaryRingResponse.energy(for: 2), 1)
-        XCTAssertGreaterThan(DictionaryRingResponse.energy(for: 0.7), DictionaryRingResponse.energy(for: 0.1))
-        for size in [176.0, 240.0] {
-            let frame = CGRect(x: 0, y: 0, width: size, height: size)
-            for tick in 0..<32 {
-                let phase = Double(tick) / 32 * .pi * 2
-                for sheet in 0..<DictionaryRibbon.sheets {
-                    for strand in -4...4 {
-                        let quiet = DictionaryRibbon(phase: phase, strand: Double(strand), energy: 0, sheet: sheet).path(in: frame)
-                        let speech = DictionaryRibbon(phase: phase, strand: Double(strand), energy: 1, sheet: sheet).path(in: frame)
-                        XCTAssertNotEqual(quiet, speech)
-                        XCTAssertTrue(frame.contains(speech.boundingRect), "Speech motion must not clip")
-                    }
-                }
-            }
-        }
+    func testDictionaryGlowAudioResponseIsBoundedAndHandlesInvalidLevels() {
+        XCTAssertEqual(DictionaryGlowResponse.energy(for: 0), 0)
+        XCTAssertEqual(DictionaryGlowResponse.energy(for: -1), 0)
+        XCTAssertEqual(DictionaryGlowResponse.energy(for: .nan), 0)
+        XCTAssertEqual(DictionaryGlowResponse.energy(for: .infinity), 0)
+        XCTAssertEqual(DictionaryGlowResponse.energy(for: 2), 1)
+        XCTAssertGreaterThan(DictionaryGlowResponse.energy(for: 0.7), DictionaryGlowResponse.energy(for: 0.1))
     }
 
     func testDictionaryPlaygroundMatchesWholeWordsWithoutTreatingSimilarWordsAsSuccess() {
@@ -4010,7 +3996,8 @@ extension DictationE2ETests {
                     onNewWord: { actions += 1 },
                     onManual: { actions += 1 },
                     onPracticeMore: { actions += 1 },
-                    onRedo: { actions += 1 }
+                    onRedo: { actions += 1 },
+                    attempts: Array(["boot tea", "Booptie", "FluidVoice"].prefix(state.0))
                 )
                 .padding(24)
                 .frame(width: width, height: 950, alignment: .top)

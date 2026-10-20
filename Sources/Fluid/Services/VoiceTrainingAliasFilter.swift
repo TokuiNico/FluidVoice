@@ -27,11 +27,13 @@ enum VoiceTrainingAliasFilter {
         alias.lowercased().trimmingCharacters(in: .punctuationCharacters.union(.whitespacesAndNewlines))
     }
 
-    static func filter(_ aliases: [String]) async -> Result {
+    static func filter(_ aliases: [String], manuallyConfirmed: Set<String> = []) async -> Result {
         guard !Task.isCancelled else { return Result(accepted: [], rejected: aliases) }
         // Training already caps captures at twenty; bound this entry point independently.
         let accepted = aliases.prefix(20).filter { alias in
-            guard !alias.isEmpty, alias.count <= 160, alias.contains(where: \.isLetter) else { return false }
+            guard !alias.isEmpty, alias.count <= 160 else { return false }
+            if manuallyConfirmed.contains(alias) { return true }
+            guard alias.contains(where: \.isLetter) else { return false }
             let normalized = self.normalizedAlias(alias)
             return !self.basicWords.contains(normalized)
         }
