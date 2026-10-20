@@ -74,6 +74,8 @@ struct CustomDictionaryView: View {
     @State private var manualReturnStep: DictionaryWordWizardStep = .spelling
     @State private var manualTriggerDraft = ""
     @State private var manualReplacement = ""
+    @State private var manualEntryFocusRequest = 0
+    @FocusState private var manualReplacementFocused: Bool
     @State private var isYourDictionaryPresented = false
     @State private var isPunctuationDictionaryPresented = false
     @State private var punctuationAutoConvertEnabled = SettingsStore.shared.autoConvertPunctuationEnabled
@@ -217,6 +219,10 @@ struct CustomDictionaryView: View {
         !self.manualTriggers.isEmpty &&
             !self.sanitizedManualReplacement.isEmpty &&
             self.manualDuplicateTriggers.isEmpty
+    }
+
+    private var isManualEntryBlocked: Bool {
+        self.isTrainingStarting || self.isTrainingRecording || self.isTrainingProcessing || self.isAutomaticTrainingEnabled
     }
 
     private var punctuationEditorTitle: String {
@@ -445,15 +451,15 @@ struct CustomDictionaryView: View {
                 Spacer()
                 FluidGlassControlGroup {
                     HStack(spacing: 8) {
-                        Button(action: self.startNewDictionaryWord) {
+                        Button(action: self.openNewManualDictionaryEntry) {
                             Image(systemName: "plus")
                                 .font(.system(size: 12, weight: .semibold))
                                 .frame(width: 18, height: 18)
                         }
                         .fluidGlassAction(circular: true, quiet: true)
-                        .disabled(self.asr.isRunning || self.isTrainingStarting || self.isTrainingRecording || self.isTrainingProcessing || self.isAutomaticTrainingEnabled)
+                        .disabled(self.isManualEntryBlocked)
                         .accessibilityLabel("Add word")
-                        .help("Add a new word")
+                        .help(self.isManualEntryBlocked ? "Finish the current word recording or save first" : "Add a word manually")
                         Button { self.isDrawerActionsPresented.toggle() } label: {
                             Image(systemName: "ellipsis")
                                 .font(.system(size: 12, weight: .semibold))
@@ -832,6 +838,7 @@ struct CustomDictionaryView: View {
 
             TextField("fluid voice, fluid boys", text: self.$manualTriggerDraft)
                 .dictionaryInputChrome()
+                .accessibilityLabel("Misheard words")
                 .onSubmit { self.addManualReplacementIfValid() }
 
             Text("Separate different versions with commas. Enter only commas to replace comma punctuation.")
@@ -846,7 +853,14 @@ struct CustomDictionaryView: View {
                 .font(self.theme.typography.captionStrong)
             TextField("FluidVoice", text: self.$manualReplacement)
                 .dictionaryInputChrome()
+                .focused(self.$manualReplacementFocused)
+                .accessibilityLabel("Correct word")
                 .onSubmit { self.addManualReplacementIfValid() }
+                .task(id: self.manualEntryFocusRequest) {
+                    await Task.yield()
+                    guard !Task.isCancelled else { return }
+                    self.manualReplacementFocused = true
+                }
             Text("The spelling you want in your transcription.")
                 .font(self.theme.typography.caption)
                 .foregroundStyle(self.theme.palette.secondaryText)
@@ -2547,6 +2561,19 @@ struct CustomDictionaryView: View {
             self.lastTrainingOutputIsCovered = false
             self.consecutiveCoveredCaptures = 0
         }
+    }
+
+    private func openNewManualDictionaryEntry() {
+        guard !self.isManualEntryBlocked else { return }
+        self.isDrawerActionsPresented = false
+        if self.wizardStep != .manual {
+            self.manualReturnStep = self.wizardStep
+            self.manualSourceWord = ""
+            self.manualReplacement = ""
+            self.manualTriggerDraft = ""
+            self.wizardStep = .manual
+        }
+        self.manualEntryFocusRequest &+= 1
     }
 
     private func startNewDictionaryWord() {
