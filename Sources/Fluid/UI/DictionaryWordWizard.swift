@@ -796,7 +796,6 @@ struct DictionaryWordPlayground: View {
     @Environment(\.theme) private var theme
     @FocusState private var editorFocused: Bool
     @State private var test = DictionaryShortcutTestState()
-    @AppStorage("DictionaryPronunciationDebugCapture") private var debugCapture = false
 
     private var shortcut: String {
         let value = SettingsStore.shared.primaryDictationShortcutDisplayString
@@ -847,11 +846,6 @@ struct DictionaryWordPlayground: View {
                     .foregroundStyle(self.theme.palette.secondaryText)
             case .none:
                 EmptyView()
-            }
-            if DictionaryPronunciationExperiment.enabled {
-                Toggle("Save dictionary debug audio locally", isOn: self.$debugCapture)
-                    .font(self.theme.typography.caption)
-                    .help("Saves audio, embeddings, cuts and scores locally. Switch off to stop collection. Keeps at most 50 debug reports / 200 MB.")
             }
         }
         .task(id: self.word) {

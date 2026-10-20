@@ -347,7 +347,13 @@ struct CustomDictionaryView: View {
         .sheet(item: self.$editingEntry) { entry in
             EditDictionaryEntrySheet(
                 entry: entry,
-                existingTriggers: self.allExistingTriggers(excluding: entry.id)
+                existingTriggers: self.allExistingTriggers(excluding: entry.id),
+                isCaptureBusy: self.asr.isRunning || self.isTrainingStarting || self.isTrainingRecording || self.isTrainingProcessing,
+                onTest: {
+                    self.wizardSavedWord = entry.replacement
+                    self.wizardStep = .saved
+                    self.isWordDrawerPresented = false
+                }
             ) { updatedEntry in
                 if let index = self.entries.firstIndex(where: { $0.id == updatedEntry.id }) {
                     self.entries[index] = updatedEntry
@@ -446,19 +452,19 @@ struct CustomDictionaryView: View {
                     HStack(spacing: 8) {
                         Button(action: self.startNewDictionaryWord) {
                             Image(systemName: "plus")
-                                .font(.system(size: 13, weight: .semibold))
-                                .frame(width: 20, height: 20)
+                                .font(.system(size: 12, weight: .semibold))
+                                .frame(width: 18, height: 18)
                         }
-                        .fluidGlassAction(circular: true)
+                        .fluidGlassAction(circular: true, quiet: true)
                         .disabled(self.asr.isRunning || self.isTrainingStarting || self.isTrainingRecording || self.isTrainingProcessing || self.isAutomaticTrainingEnabled)
                         .accessibilityLabel("Add word")
                         .help("Add a new word")
                         Button { self.isDrawerActionsPresented.toggle() } label: {
                             Image(systemName: "ellipsis")
-                                .font(.system(size: 13, weight: .semibold))
-                                .frame(width: 20, height: 20)
+                                .font(.system(size: 12, weight: .semibold))
+                                .frame(width: 18, height: 18)
                         }
-                        .fluidGlassAction(circular: true)
+                        .fluidGlassAction(circular: true, quiet: true)
                         .accessibilityLabel("Dictionary actions")
                         .popover(isPresented: self.$isDrawerActionsPresented) {
                             VStack(alignment: .leading, spacing: 12) {
@@ -501,32 +507,25 @@ struct CustomDictionaryView: View {
                                     .font(self.theme.typography.caption)
                                     .foregroundStyle(self.theme.palette.secondaryText)
                                     .lineLimit(3)
-                                Button("Test word") {
-                                    self.wizardSavedWord = entry.replacement
-                                    self.wizardStep = .saved
-                                    self.isWordDrawerPresented = false
-                                }.fluidGlassAction()
-                                    .disabled(self.asr.isRunning || self.isTrainingStarting || self.isTrainingProcessing)
-                                    .accessibilityLabel("Test \(entry.replacement)")
                             }
                             Spacer()
                             Button { self.editingEntry = entry } label: {
                                 FluidPencilShape()
                                     .stroke(style: StrokeStyle(lineWidth: 1.7, lineCap: .round, lineJoin: .round))
-                                    .frame(width: 20, height: 20)
-                                    .frame(width: 22, height: 22)
+                                    .frame(width: 14, height: 14)
+                                    .frame(width: 18, height: 18)
                                     .contentShape(Rectangle())
                             }
-                            .fluidGlassAction(circular: true)
+                            .fluidGlassAction(circular: true, quiet: true)
                             .help("Edit word")
                             .accessibilityLabel("Edit \(entry.replacement)")
                             Button(role: .destructive) { self.drawerDeletion = entry } label: {
                                 Image(systemName: "trash")
-                                    .font(.fluidSystem(size: 15, weight: .regular))
-                                    .frame(width: 22, height: 22)
+                                    .font(.fluidSystem(size: 12, weight: .regular))
+                                    .frame(width: 18, height: 18)
                                     .contentShape(Rectangle())
                             }
-                            .fluidGlassAction(circular: true)
+                            .fluidGlassAction(circular: true, quiet: true)
                             .help("Delete word")
                             .accessibilityLabel("Delete \(entry.replacement)")
                         }
@@ -4021,6 +4020,8 @@ struct EditDictionaryEntrySheet: View {
 
     let entry: SettingsStore.CustomDictionaryEntry
     let existingTriggers: Set<String>
+    let isCaptureBusy: Bool
+    let onTest: () -> Void
     let onSave: (SettingsStore.CustomDictionaryEntry) -> Void
 
     @State private var triggersText = ""
@@ -4034,6 +4035,11 @@ struct EditDictionaryEntrySheet: View {
         !self.parseTriggers().isEmpty &&
             !CustomDictionaryManualEntry.sanitizedReplacement(self.replacement).isEmpty &&
             self.duplicateTriggers.isEmpty
+    }
+
+    private var hasUnsavedChanges: Bool {
+        self.parseTriggers() != self.entry.triggers ||
+            CustomDictionaryManualEntry.sanitizedReplacement(self.replacement) != self.entry.replacement
     }
 
     var body: some View {
@@ -4104,6 +4110,13 @@ struct EditDictionaryEntrySheet: View {
             Divider()
             // Save button
             HStack {
+                Button("Test word") {
+                    self.onTest()
+                    self.dismiss()
+                }
+                .fluidGlassAction(quiet: true)
+                .disabled(self.hasUnsavedChanges || self.isCaptureBusy)
+                .help(self.hasUnsavedChanges ? "Save your changes before testing this word." : "Try this word with your dictation shortcut.")
                 Spacer()
                 Button("Save Changes") { self.saveIfValid() }
                     .fluidGlassAction(prominent: true, tone: self.theme.palette.accent)
