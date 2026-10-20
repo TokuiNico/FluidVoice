@@ -232,3 +232,6 @@ builds/
 !README.md
 !CONTRIBUTING.md
 !.github/pull_request_template.md
+
+# Local Claude Code settings and worktrees
+.claude/
