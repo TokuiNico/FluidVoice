@@ -348,12 +348,7 @@ struct CustomDictionaryView: View {
             EditDictionaryEntrySheet(
                 entry: entry,
                 existingTriggers: self.allExistingTriggers(excluding: entry.id),
-                isCaptureBusy: self.asr.isRunning || self.isTrainingStarting || self.isTrainingRecording || self.isTrainingProcessing,
-                onTest: {
-                    self.wizardSavedWord = entry.replacement
-                    self.wizardStep = .saved
-                    self.isWordDrawerPresented = false
-                }
+                isCaptureBusy: self.asr.isRunning || self.isTrainingStarting || self.isTrainingRecording || self.isTrainingProcessing
             ) { updatedEntry in
                 if let index = self.entries.firstIndex(where: { $0.id == updatedEntry.id }) {
                     self.entries[index] = updatedEntry
@@ -4021,11 +4016,12 @@ struct EditDictionaryEntrySheet: View {
     let entry: SettingsStore.CustomDictionaryEntry
     let existingTriggers: Set<String>
     let isCaptureBusy: Bool
-    let onTest: () -> Void
     let onSave: (SettingsStore.CustomDictionaryEntry) -> Void
 
     @State private var triggersText = ""
     @State private var replacement = ""
+    @State private var isTestingWord = false
+    @State private var isTestBusy = false
 
     private var duplicateTriggers: [String] {
         self.parseTriggers().filter { self.existingTriggers.contains($0) }
@@ -4056,78 +4052,100 @@ struct EditDictionaryEntrySheet: View {
 
             Divider()
 
-            ScrollView {
-                VStack(alignment: .leading, spacing: 20) {
-                    // Triggers input
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Misheard Words (triggers)")
-                            .font(.fluidSystem(.subheadline).weight(.medium))
-                        Text("Add one version per line. Commas can be saved too.")
-                            .font(.fluidSystem(.caption))
-                            .foregroundStyle(.secondary)
-                        TextEditor(text: self.$triggersText)
-                            .font(.fluidSystem(.body))
-                            .frame(minHeight: 54, maxHeight: 76)
-                            .scrollContentBackground(.hidden)
-                            .dictionaryInputChrome(minHeight: 54)
+            ScrollViewReader { scroll in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 20) {
+                        // Triggers input
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Misheard Words (triggers)")
+                                .font(.fluidSystem(.subheadline).weight(.medium))
+                            Text("Add one version per line. Commas can be saved too.")
+                                .font(.fluidSystem(.caption))
+                                .foregroundStyle(.secondary)
+                            TextEditor(text: self.$triggersText)
+                                .font(.fluidSystem(.body))
+                                .frame(minHeight: 54, maxHeight: 76)
+                                .scrollContentBackground(.hidden)
+                                .dictionaryInputChrome(minHeight: 54)
 
-                        // Duplicate warning
-                        if !self.duplicateTriggers.isEmpty {
-                            HStack(spacing: 4) {
-                                Image(systemName: "exclamationmark.triangle.fill")
-                                    .foregroundStyle(.orange)
-                                Text("Duplicate triggers: \(self.duplicateTriggers.joined(separator: ", "))")
-                                    .foregroundStyle(.orange)
+                            // Duplicate warning
+                            if !self.duplicateTriggers.isEmpty {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "exclamationmark.triangle.fill")
+                                        .foregroundStyle(.orange)
+                                    Text("Duplicate triggers: \(self.duplicateTriggers.joined(separator: ", "))")
+                                        .foregroundStyle(.orange)
+                                }
+                                .font(.fluidSystem(.caption))
                             }
-                            .font(.fluidSystem(.caption))
+                        }
+                        .disabled(self.isTestBusy)
+
+                        // Replacement input
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Correct Spelling (replacement)")
+                                .font(.fluidSystem(.subheadline).weight(.medium))
+                            Text("This is what will appear in the final transcription.")
+                                .font(.fluidSystem(.caption))
+                                .foregroundStyle(.secondary)
+                            TextField("FluidVoice", text: self.$replacement)
+                                .dictionaryInputChrome()
+                                .onSubmit { self.saveIfValid() }
+                        }
+                        .disabled(self.isTestBusy)
+
+                        if !self.parseTriggers().isEmpty && !self.replacement.isEmpty {
+                            DictionaryReplacementPreview(
+                                triggers: self.parseTriggers(),
+                                replacement: self.replacement,
+                                duplicateTriggers: self.duplicateTriggers
+                            )
+                        }
+
+                        if self.isTestingWord {
+                            Divider()
+                            DictionaryWordPlayground(
+                                word: self.entry.replacement,
+                                onPracticeMore: nil,
+                                busy: self.$isTestBusy
+                            )
+                            .id("dictionary-word-test")
                         }
                     }
-
-                    // Replacement input
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Correct Spelling (replacement)")
-                            .font(.fluidSystem(.subheadline).weight(.medium))
-                        Text("This is what will appear in the final transcription.")
-                            .font(.fluidSystem(.caption))
-                            .foregroundStyle(.secondary)
-                        TextField("FluidVoice", text: self.$replacement)
-                            .dictionaryInputChrome()
-                            .onSubmit { self.saveIfValid() }
-                    }
-
-                    if !self.parseTriggers().isEmpty && !self.replacement.isEmpty {
-                        DictionaryReplacementPreview(
-                            triggers: self.parseTriggers(),
-                            replacement: self.replacement,
-                            duplicateTriggers: self.duplicateTriggers
-                        )
-                    }
+                    .padding(2)
                 }
-                .padding(2)
+                .task(id: self.isTestingWord) {
+                    guard self.isTestingWord else { return }
+                    await Task.yield()
+                    guard !Task.isCancelled else { return }
+                    scroll.scrollTo("dictionary-word-test", anchor: .bottom)
+                }
             }
             .frame(minHeight: 0, maxHeight: .infinity)
 
             Divider()
             // Save button
             HStack {
-                Button("Test word") {
-                    self.onTest()
-                    self.dismiss()
+                Button(self.isTestingWord ? "Hide test" : "Test word") {
+                    self.isTestingWord.toggle()
                 }
                 .fluidGlassAction(quiet: true)
-                .disabled(self.hasUnsavedChanges || self.isCaptureBusy)
+                .disabled(self.hasUnsavedChanges || self.isCaptureBusy || self.isTestBusy)
                 .help(self.hasUnsavedChanges ? "Save your changes before testing this word." : "Try this word with your dictation shortcut.")
                 Spacer()
                 Button("Save Changes") { self.saveIfValid() }
                     .fluidGlassAction(prominent: true, tone: self.theme.palette.accent)
-                    .disabled(!self.canSave)
+                    .disabled(!self.canSave || self.isTestBusy)
                     .keyboardShortcut(.return, modifiers: [])
             }
         }
         .padding(20)
         .frame(minWidth: 400, idealWidth: 480, maxWidth: 560)
-        .frame(minHeight: 360, idealHeight: 500, maxHeight: 600)
+        .frame(minHeight: 360, idealHeight: self.isTestingWord ? 680 : 500, maxHeight: self.isTestingWord ? 780 : 600)
         .dismissTextFocusOnBackgroundTap()
+        .onChange(of: self.hasUnsavedChanges) { _, changed in
+            if changed { self.isTestingWord = false }
+        }
         .onAppear {
             self.triggersText = self.entry.triggers.joined(separator: "\n")
             self.replacement = self.entry.replacement
@@ -4141,7 +4159,7 @@ struct EditDictionaryEntrySheet: View {
     }
 
     private func saveIfValid() {
-        guard self.canSave else { return }
+        guard self.canSave, !self.isTestBusy else { return }
 
         let updatedEntry = SettingsStore.CustomDictionaryEntry(
             id: self.entry.id,

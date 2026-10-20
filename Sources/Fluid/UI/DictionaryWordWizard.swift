@@ -790,7 +790,7 @@ struct DictionaryRibbon: Shape {
 /// Uses normal shortcut dictation, accepting output only for a capture begun in this editor.
 struct DictionaryWordPlayground: View {
     let word: String
-    let onPracticeMore: () -> Void
+    let onPracticeMore: (() -> Void)?
     @Binding var busy: Bool
     @EnvironmentObject private var appServices: AppServices
     @Environment(\.theme) private var theme
@@ -834,12 +834,14 @@ struct DictionaryWordPlayground: View {
                     .font(self.theme.typography.bodyStrong)
                     .foregroundStyle(self.theme.palette.accent)
             case .missed:
-                Text("We didn’t catch “\(self.word)”. Try again, or add more examples.")
+                Text("We didn’t catch “\(self.word)”. Try your shortcut again.")
                     .font(self.theme.typography.body)
                     .foregroundStyle(self.theme.palette.secondaryText)
-                Button("Record more examples", action: self.onPracticeMore)
-                    .fluidGlassAction()
-                    .disabled(self.busy)
+                if let onPracticeMore {
+                    Button("Record more examples", action: onPracticeMore)
+                        .fluidGlassAction()
+                        .disabled(self.busy)
+                }
             case .empty:
                 Text("No words came through. Try your shortcut again.")
                     .font(self.theme.typography.body)
@@ -850,8 +852,11 @@ struct DictionaryWordPlayground: View {
         }
         .task(id: self.word) {
             self.test = DictionaryShortcutTestState()
-            self.editorFocused = true
             self.busy = false
+            self.editorFocused = false
+            await Task.yield()
+            guard !Task.isCancelled else { return }
+            self.editorFocused = true
         }
         .onReceive(self.appServices.asr.$isRunning.dropFirst()) { running in
             if running {
