@@ -36,6 +36,7 @@ struct DictionaryWordWizard: View {
     let onManual: () -> Void
     let onPracticeMore: () -> Void
     var onRedo: () -> Void = {}
+    var wordFocusRequest = 0
     var automaticCaptureActive = false
     var audioLevels: AnyPublisher<CGFloat, Never> = Empty().eraseToAnyPublisher()
     var pronunciationNotice: String?
@@ -97,6 +98,13 @@ struct DictionaryWordWizard: View {
             Button("Change word", role: .destructive) { self.word = self.pendingWord }
         }
         .task(id: self.step) { self.wordFocused = self.step == .spelling }
+        .task(id: self.wordFocusRequest) {
+            guard self.wordFocusRequest != 0 else { return }
+            self.wordFocused = false
+            await Task.yield()
+            guard !Task.isCancelled else { return }
+            self.wordFocused = self.step == .spelling
+        }
     }
 
     private var spelling: some View {

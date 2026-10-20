@@ -19,6 +19,7 @@ struct CustomDictionaryView: View {
     @State private var isWordDrawerPresented = true
     @State private var wordSearch = ""
     @State private var isDrawerActionsPresented = false
+    @State private var newWordFocusRequest = 0
     @State private var drawerDeletion: SettingsStore.CustomDictionaryEntry?
     @Environment(\.theme) private var theme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -441,30 +442,43 @@ struct CustomDictionaryView: View {
             HStack(alignment: .center, spacing: 8) {
                 Text("Your dictionary").font(self.theme.typography.sectionTitle)
                 Spacer()
-                Button { self.isDrawerActionsPresented.toggle() } label: {
-                    Image(systemName: "ellipsis")
-                        .font(.system(size: 13, weight: .semibold))
-                        .frame(width: 20, height: 20)
-                }
-                .fluidGlassAction(circular: true)
-                .accessibilityLabel("Dictionary actions")
-                .popover(isPresented: self.$isDrawerActionsPresented) {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Button("Import…") {
-                            self.isDrawerActionsPresented = false
-                            self.importDictionary()
-                        }.fluidGlassAction()
-                        Button("Export…") {
-                            self.isDrawerActionsPresented = false
-                            self.exportDictionary()
-                        }.fluidGlassAction()
-                        Divider()
-                        Button("Custom Words (Advanced)…") {
-                            self.isDrawerActionsPresented = false
-                            self.presentCustomWords()
-                        }.fluidGlassAction()
+                FluidGlassControlGroup {
+                    HStack(spacing: 8) {
+                        Button(action: self.startNewDictionaryWord) {
+                            Image(systemName: "plus")
+                                .font(.system(size: 13, weight: .semibold))
+                                .frame(width: 20, height: 20)
+                        }
+                        .fluidGlassAction(circular: true)
+                        .disabled(self.asr.isRunning || self.isTrainingStarting || self.isTrainingRecording || self.isTrainingProcessing || self.isAutomaticTrainingEnabled)
+                        .accessibilityLabel("Add word")
+                        .help("Add a new word")
+                        Button { self.isDrawerActionsPresented.toggle() } label: {
+                            Image(systemName: "ellipsis")
+                                .font(.system(size: 13, weight: .semibold))
+                                .frame(width: 20, height: 20)
+                        }
+                        .fluidGlassAction(circular: true)
+                        .accessibilityLabel("Dictionary actions")
+                        .popover(isPresented: self.$isDrawerActionsPresented) {
+                            VStack(alignment: .leading, spacing: 12) {
+                                Button("Import…") {
+                                    self.isDrawerActionsPresented = false
+                                    self.importDictionary()
+                                }.fluidGlassAction()
+                                Button("Export…") {
+                                    self.isDrawerActionsPresented = false
+                                    self.exportDictionary()
+                                }.fluidGlassAction()
+                                Divider()
+                                Button("Custom Words (Advanced)…") {
+                                    self.isDrawerActionsPresented = false
+                                    self.presentCustomWords()
+                                }.fluidGlassAction()
+                            }
+                            .padding(16)
+                        }
                     }
-                    .padding(16)
                 }
             }
             HStack(spacing: 8) {
@@ -630,7 +644,7 @@ struct CustomDictionaryView: View {
                         }
                     },
                     onBack: { self.wizardStep = .spelling },
-                    onNewWord: { self.resetTraining(); self.wizardStep = .spelling },
+                    onNewWord: self.startNewDictionaryWord,
                     onManual: {
                         self.manualReturnStep = self.wizardStep
                         if self.manualSourceWord != self.normalizedTrainingReplacement || self.manualReplacement.isEmpty {
@@ -649,6 +663,7 @@ struct CustomDictionaryView: View {
                         self.resetTraining(keepingWord: true)
                         self.wizardStep = .recording
                     },
+                    wordFocusRequest: self.newWordFocusRequest,
                     automaticCaptureActive: self.isAutomaticTrainingEnabled,
                     audioLevels: self.asr.audioLevelPublisher,
                     pronunciationNotice: self.trainingProgress.pronunciationNotice,
@@ -2538,6 +2553,13 @@ struct CustomDictionaryView: View {
             self.lastTrainingOutputIsCovered = false
             self.consecutiveCoveredCaptures = 0
         }
+    }
+
+    private func startNewDictionaryWord() {
+        self.isDrawerActionsPresented = false
+        self.resetTraining()
+        self.wizardStep = .spelling
+        self.newWordFocusRequest &+= 1
     }
 
     private func resetTraining(statusMessage: String = "Type the correct text.", keepingWord: Bool = false) {

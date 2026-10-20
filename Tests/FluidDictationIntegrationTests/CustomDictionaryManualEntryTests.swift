@@ -133,6 +133,8 @@ final class CustomDictionaryManualEntryTests: XCTestCase {
         for toggleDuringCapture in [false, true] {
             DictionaryMatcherExperiment.setEnabled(toggleDuringCapture)
             let monitor = DictionaryTrainingEndpointMonitor()
+            // Measure speech-end handling after the model is ready, as the word wizard does.
+            await monitor.prepare()
             let stopped = expectation(description: "Speech ends independently of pronunciation")
             var callbacks = 0
             monitor.start(
