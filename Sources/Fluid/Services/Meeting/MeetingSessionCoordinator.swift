@@ -1797,7 +1797,11 @@ final class MeetingSessionCoordinator: ObservableObject {
 
     private func handleCaptureEvent(_ event: MeetingCaptureEvent, generation: UUID) {
         guard self.captureGeneration == generation, var session = self.activeSession else { return }
+        self.liveTranscriptionCoordinator?.recordComparisonCaptureEvent(event)
         switch event {
+        case let .audioComparisonProbeStarted(probe):
+            self.liveTranscriptionCoordinator?.attachComparisonProbe(probe)
+            return // Diagnostic-only: no recording, persistence, navigation or transcript writes.
         case let .microphoneEchoProtectionChanged(protection):
             let kind: MeetingInterruptionKind = protection == .unfiltered ? .echoFilteringUnavailable : .echoFilteringRestored
             if session.events.last(where: { $0.kind == .echoFilteringUnavailable || $0.kind == .echoFilteringRestored })?.kind == kind {

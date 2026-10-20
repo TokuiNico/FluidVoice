@@ -30,6 +30,7 @@ actor MeetingCaptureEngine: MeetingCaptureControlling {
         var sessionID: MeetingSessionID
         var runtime: any MeetingCaptureRuntime
         var writers: [MeetingAudioChunkWriter]
+        var comparisonProbe: MeetingAudioComparisonProbe?
     }
 
     private var activeCapture: ActiveCapture?
@@ -61,13 +62,35 @@ actor MeetingCaptureEngine: MeetingCaptureControlling {
         )
         try Self.verifyMicrophonePermission()
 
+        let comparisonProbe: MeetingAudioComparisonProbe?
+        if let expiration = MeetingAudioComparisonProbe.requestExpiration(mode: configuration.mode) {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("FluidVoice-AudioComparison", isDirectory: true)
+                .appendingPathComponent(session.id.uuidString, isDirectory: true)
+            comparisonProbe = try? MeetingAudioComparisonProbe(session: session, directory: directory, onUsefulComparison: {
+                MeetingAudioComparisonProbe.completeRequest(expiration: expiration)
+            })
+            DebugLogger.shared.info("Audio comparison probe \(comparisonProbe == nil ? "failed to start" : "armed") at \(directory.path)", source: "MeetingCaptureEngine")
+        } else {
+            comparisonProbe = nil
+        }
+        if let comparisonProbe { eventHandler(.audioComparisonProbeStarted(comparisonProbe)) }
+        // If setup exits before an active capture owns the probe, still finalize its files.
+        var probeOwnedByCapture = false
+        defer {
+            if !probeOwnedByCapture, let comparisonProbe { Task { await comparisonProbe.stop() } }
+        }
         let tracks = Self.makeTracks(session: session, configuration: configuration)
         let writers = try tracks.map { track in
             try MeetingAudioChunkWriter(
                 track: track,
                 sessionDirectory: sessionDirectory,
                 chunkDuration: configuration.chunkDuration,
-                eventHandler: eventHandler
+                eventHandler: eventHandler,
+                diagnosticSampleObserver: comparisonProbe.map { probe in
+                    let stage: MeetingAudioComparisonProbe.Stage = track.kind == .microphone ? .microphoneOutput : .browser
+                    return { sample, epoch in probe.offer(sample, stage: stage, producerEpoch: epoch) }
+                }
             )
         }
         let writersByKind = Dictionary(uniqueKeysWithValues: zip(tracks.map(\.kind), writers))
@@ -127,6 +150,7 @@ actor MeetingCaptureEngine: MeetingCaptureControlling {
                     application: application,
                     microphone: configuration.microphone,
                     includeMicrophone: true,
+                    comparisonProbe: comparisonProbe,
                     microphoneEchoProtection: .unprotected,
                     applicationWriter: applicationWriter,
                     microphoneWriter: microphoneWriter,
@@ -173,8 +197,10 @@ actor MeetingCaptureEngine: MeetingCaptureControlling {
         self.activeCapture = ActiveCapture(
             sessionID: session.id,
             runtime: runtime,
-            writers: writers
+            writers: writers,
+            comparisonProbe: comparisonProbe
         )
+        probeOwnedByCapture = true
         // Re-snapshot: a VPIO commit during start() promotes provenance on the writer's own track.
         let settledTracks = await withTaskGroup(of: MeetingAudioTrack.self, returning: [MeetingAudioTrack].self) { group in
             for writer in writers {
@@ -225,6 +251,7 @@ actor MeetingCaptureEngine: MeetingCaptureControlling {
             AudioTopologyDiagnostics.record(.phaseBegin, owner: .meetingCaptureEngine, queueRole: .actorControl, phase: .writerStop)
             #endif
             let tracks = await Self.stopWriters(activeCapture.writers)
+            activeCapture.comparisonProbe?.finishAfterCaptionTeardown()
             #if DEBUG
             AudioTopologyDiagnostics.record(.phaseEnd, owner: .meetingCaptureEngine, queueRole: .actorControl, phase: .writerStop)
             #endif
@@ -567,6 +594,7 @@ nonisolated enum MeetingDirectAEC3Availability {
 private final nonisolated class ScreenCaptureMeetingRuntime: NSObject, MeetingCaptureRuntime, SCStreamOutput, SCStreamDelegate,
     @unchecked Sendable
 {
+    private let comparisonProbe: MeetingAudioComparisonProbe?
     private let microphonePCMNormalizer = MeetingMicrophonePCMNormalizer()
     /// HAL notifications can arrive while the default input/output pair is still converging.
     /// Admission stays closed until the latest route revision has settled.
@@ -648,12 +676,14 @@ private final nonisolated class ScreenCaptureMeetingRuntime: NSObject, MeetingCa
         requestedMicrophone: MeetingMicrophoneIdentity,
         activeMicrophone: MeetingMicrophoneIdentity,
         includeMicrophone: Bool,
+        comparisonProbe: MeetingAudioComparisonProbe?,
         microphoneEchoProtection: MeetingMicrophoneEchoProtection,
         applicationWriter: MeetingAudioChunkWriter,
         microphoneWriter: MeetingAudioChunkWriter,
         eventHandler: @escaping @Sendable (MeetingCaptureEvent) -> Void,
         liveAudioHandler: (@Sendable (MeetingAudioTrackKind, CMSampleBuffer) -> Void)?
     ) {
+        self.comparisonProbe = comparisonProbe
         self.stream = stream
         self.scope = scope
         self.application = application
@@ -678,6 +708,7 @@ private final nonisolated class ScreenCaptureMeetingRuntime: NSObject, MeetingCa
         application: MeetingApplicationIdentity,
         microphone: MeetingMicrophoneIdentity,
         includeMicrophone: Bool = true,
+        comparisonProbe: MeetingAudioComparisonProbe? = nil,
         microphoneEchoProtection: MeetingMicrophoneEchoProtection = .unprotected,
         applicationWriter: MeetingAudioChunkWriter,
         microphoneWriter: MeetingAudioChunkWriter,
@@ -711,6 +742,7 @@ private final nonisolated class ScreenCaptureMeetingRuntime: NSObject, MeetingCa
             requestedMicrophone: microphone,
             activeMicrophone: resolvedMicrophone,
             includeMicrophone: includeMicrophone,
+            comparisonProbe: comparisonProbe,
             microphoneEchoProtection: microphoneEchoProtection,
             applicationWriter: applicationWriter,
             microphoneWriter: microphoneWriter,
@@ -1020,6 +1052,7 @@ private final nonisolated class ScreenCaptureMeetingRuntime: NSObject, MeetingCa
             self.recordPairedDiagnostic(sampleBuffer, output: .microphone)
             #endif
             let sampleBuffer = self.microphonePCMNormalizer.normalize(sampleBuffer)
+            self.comparisonProbe?.offer(sampleBuffer, stage: .microphoneInput, producerEpoch: streamToken.generation)
             switch aecState {
             case .active:
                 pipeline?.consumeCapture(sampleBuffer, stream: streamToken)
@@ -1199,7 +1232,15 @@ private final nonisolated class ScreenCaptureMeetingRuntime: NSObject, MeetingCa
         ) { [weak self] failure in
             self?.handleAECTerminalFailure(failure)
         }
-        let candidate = MeetingAECPipeline(processor: processor, committer: committer)
+        let candidate = MeetingAECPipeline(
+            processor: processor,
+            committer: committer,
+            diagnosticObserver: self.comparisonProbe.map { probe in
+                { frame, output, statistics in
+                    probe.recordAECFrame(frame, output: output, statistics: statistics)
+                }
+            }
+        )
 
         let committed = self.stateLock.withLock { () -> Bool in
             let mayCommit = MeetingCaptureOwnershipGate.mayCommitAEC(

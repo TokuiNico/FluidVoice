@@ -1394,6 +1394,8 @@ final nonisolated class MeetingCaptureMethodChangeAck: @unchecked Sendable {
 }
 
 nonisolated enum MeetingCaptureEvent: Sendable {
+    /// Explicit local investigation only; never persisted as a session interruption.
+    case audioComparisonProbeStarted(MeetingAudioComparisonProbe)
     case trackHealth(trackID: MeetingAudioTrackID, health: MeetingTrackHealth)
     /// Presentation-only status. The writer owns persisted capture eras; this cannot restart capture.
     case microphoneEchoProtectionChanged(MeetingMicrophoneEchoProtection)

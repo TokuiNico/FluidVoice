@@ -8,16 +8,19 @@ final nonisolated class MeetingAECPipeline: @unchecked Sendable {
     private var joiner = MeetingAECStreamJoiner()
     private let processor: any MeetingAECProcessing
     let committer: MeetingAECOutputCommitter
+    private let diagnosticObserver: (@Sendable (MeetingAECJoinedFrame, [Float], MeetingAECBridgeStatistics) -> Void)?
     private(set) var stopped = false
     /// Retry AEC on a new route, not on every callback while the current route is failing.
     private var fallbackFailure: MeetingAECFailure?
 
     init(
         processor: any MeetingAECProcessing,
-        committer: MeetingAECOutputCommitter
+        committer: MeetingAECOutputCommitter,
+        diagnosticObserver: (@Sendable (MeetingAECJoinedFrame, [Float], MeetingAECBridgeStatistics) -> Void)? = nil
     ) {
         self.processor = processor
         self.committer = committer
+        self.diagnosticObserver = diagnosticObserver
     }
 
     func consumeRender(_ sampleBuffer: CMSampleBuffer, stream: MeetingAECStreamToken) {
@@ -128,6 +131,7 @@ final nonisolated class MeetingAECPipeline: @unchecked Sendable {
                 render: joined.render.samples,
                 capture: joined.capture.samples
             )
+            self.diagnosticObserver?(joined, result.samples, result.statistics)
             guard let output = MeetingAECPCMAdapter.synthesize(
                 samples: result.samples,
                 presentationTime: joined.capture.presentationTime

@@ -705,11 +705,45 @@ final class MeetingLiveBoundaryTests: XCTestCase {
         await fulfillment(of: [resumed], timeout: 1)
         let snapshot = await engine.diagnosticSnapshotValue()
         XCTAssertEqual(snapshot.resetInvocations, 0)
+        XCTAssertEqual(snapshot.textPauses, 1)
+        XCTAssertEqual(snapshot.textResumptions, 1)
         await engine.stop()
     }
 
     func testFailedFlushPreservesPartialAndReportsDegradation() async throws {
         try await self.checkForcedEndpoint(failFinish: true)
+    }
+
+    func testPauseAndResumeEventsAreSavedWithoutDebugDiagnostics() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let session = MeetingSession(
+            configuration: MeetingCaptureConfiguration(mode: .inRoom, title: "Diagnostic test", microphone: MeetingMicrophoneIdentity(captureDeviceID: "test", displayName: "Test")),
+            timebase: MeetingTimebaseMetadata(startedHostTime: 0, machTimebaseNumerator: 1, machTimebaseDenominator: 1, firstPresentationTime: nil)
+        )
+        let probe = try MeetingAudioComparisonProbe(session: session, directory: root)
+        let clock = Clock()
+        let recognizer = Recognizer()
+        let engine = MeetingLiveTrackEngine(kind: .microphone, recognizer: recognizer, uptime: { clock.now() }, diagnosticsEnabled: false)
+        await engine.attachComparisonProbe(probe)
+        await engine.diagnosticInstallCallbacks()
+        try await engine.diagnosticConsume(self.sample(at: 0))
+        clock.set(6)
+        try await engine.diagnosticConsume(self.sample(at: 6))
+        clock.set(7)
+        await recognizer.resumePartial()
+        try await engine.diagnosticConsume(self.sample(at: 7))
+        clock.set(127)
+        try await engine.diagnosticConsume(self.sample(at: 127))
+        await engine.stop()
+        await probe.stop()
+        let lines = try String(contentsOf: root.appendingPathComponent("events.jsonl"), encoding: .utf8).split(separator: "\n")
+        let events = try lines.map { try XCTUnwrap(JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any]) }
+        XCTAssertTrue(events.contains { $0["step"] as? String == "model-text-pause" })
+        XCTAssertTrue(events.contains { $0["step"] as? String == "model-text-resumed" })
+        XCTAssertTrue(events.contains { $0["step"] as? String == "model-flow" && ($0["detail"] as? String)?.contains("decodeCompletions=") == true })
+        XCTAssertTrue(events.contains { $0["step"] as? String == "recognizer-reset" && $0["detail"] as? String == "noTextTimeout" })
+        XCTAssertTrue(events.contains { $0["step"] as? String == "recognizer-reset" && $0["detail"] as? String == "stopped" })
     }
 
     private func checkForcedEndpoint(failFinish: Bool) async throws {
