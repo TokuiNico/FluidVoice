@@ -4269,3 +4269,65 @@ extension DictationE2ETests {
     }
     #endif
 }
+
+extension DictationE2ETests {
+    private func stampFrames(_ rows: [Int], hidden: Int = 8) -> DictionaryMatchFrames {
+        var values: [Float] = []
+        for row in rows {
+            var frame = [Float](repeating: 0.05, count: hidden)
+            frame[row] = 1
+            values += frame
+        }
+        return DictionaryMatchFrames(hiddenSize: hidden, values: values)
+    }
+
+    func testStampMatcherFindsWordSaidSlowerInsideSentence() {
+        let word = self.stampFrames([0, 1, 2, 3, 4, 5])
+        let sentence = self.stampFrames([6, 7, 6, 7, 6] + [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5] + [7, 6, 7, 6, 7])
+        let hits = DictionaryStampMatcher.hits(references: [word], in: sentence)
+        XCTAssertEqual(hits.count, 1)
+        // Either copy of a repeated frame is an equally exact match at the edges.
+        XCTAssertTrue((5...6).contains(hits.first?.frames.lowerBound ?? -1))
+        XCTAssertTrue((16...17).contains(hits.first?.frames.upperBound ?? -1))
+        XCTAssertLessThan(hits.first?.distance ?? 1, 0.05)
+    }
+
+    func testStampMatcherIgnoresSentenceWithoutTheWord() {
+        let word = self.stampFrames([0, 1, 2, 3, 4, 5])
+        let sentence = self.stampFrames([6, 7, 6, 7, 6, 7, 6, 7, 6, 7])
+        XCTAssertTrue(DictionaryStampMatcher.hits(references: [word], in: sentence).isEmpty)
+    }
+
+    func testStampMatcherFindsEachOccurrenceOnce() {
+        let word = self.stampFrames([0, 1, 2, 3])
+        let sentence = self.stampFrames([6, 0, 1, 2, 3, 7, 6, 7, 0, 1, 2, 3, 6])
+        let hits = DictionaryStampMatcher.hits(references: [word], in: sentence)
+        XCTAssertEqual(hits.map(\.frames).sorted { $0.lowerBound < $1.lowerBound }, [1..<5, 8..<12])
+    }
+
+    func testStampMatcherRejectsMismatchedOrInvalidInput() {
+        let word = self.stampFrames([0, 1, 2, 3])
+        XCTAssertTrue(DictionaryStampMatcher.hits(references: [word], in: self.stampFrames([0, 1, 2, 3], hidden: 9)).isEmpty)
+        XCTAssertTrue(DictionaryStampMatcher.hits(references: [], in: self.stampFrames([0, 1, 2, 3])).isEmpty)
+        XCTAssertTrue(DictionaryStampMatcher.hits(references: [word], in: DictionaryMatchFrames(hiddenSize: 8, values: [])).isEmpty)
+    }
+
+    func testWordRangeDropsSilenceAndKeepsFinalPop() {
+        let rate = 16_000
+        var samples = [Float](repeating: 0.0005, count: rate / 2)
+        samples += (0..<(rate * 6 / 10)).map { Float(sin(Double($0) * 0.2) * 0.3) }
+        samples += [Float](repeating: 0.0005, count: rate * 8 / 100)
+        samples += (0..<(rate * 3 / 100)).map { Float(sin(Double($0) * 1.3) * 0.05) }
+        samples += [Float](repeating: 0.0005, count: rate / 2)
+        // Recognizer word times are loose: they start early and end before the final pop.
+        let words = [DictionaryAudioInspection.Word(text: "Grasel", start: 0.40, end: 0.80), .init(text: "Wump", start: 0.80, end: 1.0)]
+        let range = DictionaryPronunciationExperiment.wordRange(samples, words: words)
+        XCTAssertNotNil(range)
+        let start = Double(range?.lowerBound ?? 0) / Double(rate)
+        let end = Double(range?.upperBound ?? 0) / Double(rate)
+        XCTAssertEqual(start, 0.47, accuracy: 0.02, "Leading silence is dropped")
+        XCTAssertGreaterThanOrEqual(end, 1.21, "The final pop after a short gap is kept")
+        XCTAssertLessThan(end, 1.30, "Trailing silence is dropped")
+        XCTAssertNil(DictionaryPronunciationExperiment.wordRange(samples, words: []))
+    }
+}

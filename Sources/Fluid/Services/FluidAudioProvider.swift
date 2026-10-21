@@ -1326,64 +1326,78 @@ final class FluidAudioProvider: TranscriptionProvider {
         var used: [Int: [Range<Int>]] = [:]
         let compareNegatives = DictionaryMatcherExperiment.compareNegatives
         let collectNegatives = DictionaryMatcherExperiment.collectNegatives
-        var sharedComparisons = 0
         let negativeRevision = compareNegatives ? await DictionaryNegativeExampleStore.shared.revision() : nil
+        // Words recorded in the Add Word screen: slide each recording along the whole dictation.
+        // This does not depend on the averaged-window shortlist, which misses words said differently in a sentence.
+        let query = DictionaryMatchFrames(hiddenSize: features.hiddenSize, values: features.values)
+        var stampedProfiles = Set<String>()
+        for (index, profile) in profiles.enumerated() where profile.hasTemporalRecordings {
+            try Task.checkCancellation()
+            let referenceKey = DictionaryNegativeEvidenceResolver.profileKey(profile)
+            guard stampedProfiles.insert(referenceKey).inserted,
+                  let references = self.temporalReferenceCache[referenceKey] else { continue }
+            // Old isolated-query negatives must not be compared with sentence-context queries.
+            let targetSuffix = profile.modelKey == self.pronunciationModelKey ? "" : ":" + self.pronunciationModelKey
+            let evidenceKey = referenceKey + ":shared-features-v1" + targetSuffix
+            for hit in DictionaryStampMatcher.hits(references: references, in: query) {
+                let indices = wordIndex.substantiallyOverlappingWordIndices(
+                    startTime: Double(hit.frames.lowerBound) * 0.08,
+                    endTime: Double(hit.frames.upperBound) * 0.08,
+                    minimumOverlapRatio: 0
+                )
+                guard let first = indices.first, let last = indices.last else { continue }
+                let hitFrames = DictionaryMatchFrames(
+                    hiddenSize: features.hiddenSize,
+                    values: Array(features.values[(hit.frames.lowerBound * features.hiddenSize)..<(hit.frames.upperBound * features.hiddenSize)])
+                )
+                if compareNegatives {
+                    let negatives = await DictionaryNegativeExampleStore.shared.frames(entryID: profile.dictionaryEntryID, profileKey: evidenceKey, modelKey: self.pronunciationModelKey)
+                    let allowed = await DictionaryExperimentalMatcher.compareNegative(query: hitFrames, references: references, negatives: negatives)
+                    if !allowed, DictionaryMatcherExperiment.compareNegatives,
+                       await DictionaryNegativeExampleStore.shared.revision() == negativeRevision { continue }
+                }
+                try Task.checkCancellation()
+                guard DictionaryMatcherExperiment.sharedFeaturesEnabled else { continue }
+                temporalMatches.insert(TemporalMatchKey(prototypeIndex: index, frameRange: hit.frames))
+                output.append(PronunciationWindowMatch(prototypeIndex: index, score: 1 - hit.distance, frameRange: hit.frames))
+                if collectNegatives, DictionaryMatcherExperiment.collectNegatives {
+                    evidence.append(DictionaryAcousticEvidence(
+                        id: UUID(),
+                        entryID: profile.dictionaryEntryID,
+                        label: profile.label,
+                        profileKey: evidenceKey,
+                        modelKey: self.pronunciationModelKey,
+                        sourceWordRange: first..<(last + 1),
+                        frames: hitFrames
+                    ))
+                }
+                DebugLogger.shared.info(
+                    "DICTIONARY_STAMP_MATCH distance=\(String(format: "%.3f", hit.distance)) frames=\(hit.frames.lowerBound)-\(hit.frames.upperBound)",
+                    source: "PronunciationMatching"
+                )
+            }
+        }
         // Bounded experimental reranking: up to three non-overlapping candidates per word, 24 comparisons total.
         for match in matches.sorted(by: { $0.score > $1.score }) {
             try Task.checkCancellation()
             guard DictionaryMatcherExperiment.sharedFeaturesEnabled else { break }
-            guard profiles.indices.contains(match.prototypeIndex) else { continue }
+            guard profiles.indices.contains(match.prototypeIndex),
+                  !profiles[match.prototypeIndex].hasTemporalRecordings else { continue }
             // Score the complete overlapping transcript span, never just the prefix of a split word.
             let indices = wordIndex.substantiallyOverlappingWordIndices(
                 startTime: Double(match.frameRange.lowerBound) * 0.08,
                 endTime: Double(match.frameRange.upperBound) * 0.08,
                 minimumOverlapRatio: 0
             )
-            guard let first = indices.first, let last = indices.last else { continue }
-            let firstFrame = max(0, Int(floor(words[first].startTime / 0.08)))
-            let lastFrame = max(firstFrame + 1, Int(ceil(words[last].endTime / 0.08)))
-            let alignedFrames = firstFrame..<lastFrame
-            let lower = min(samples.count, firstFrame * 1280)
-            let upper = min(samples.count, max(lower, lastFrame * 1280))
-            let range = lower..<upper
-            guard !range.isEmpty, range.count <= 16_000 * 15,
-                  (used[match.prototypeIndex]?.count ?? 0) < 3,
-                  !(used[match.prototypeIndex] ?? []).contains(where: { $0.overlaps(range) }),
-                  let trimmed = DictionaryPronunciationExperiment.trimmedRange(samples, within: range) else { continue }
-            do {
-                guard sharedComparisons < 24 else { break }
-                used[match.prototypeIndex, default: []].append(range)
-                sharedComparisons += 1
-                let profile = profiles[match.prototypeIndex]
-                if !profile.hasTemporalRecordings {
-                    let heard = indices.map { words[$0].text }.joined(separator: " ")
-                    if DictionaryPronunciationDecision.accepts(score: match.score, heardText: heard, profile: profile) {
-                        output.append(match)
-                    }
-                    continue
-                }
-                let referenceKey = DictionaryNegativeEvidenceResolver.profileKey(profile)
-                // Old isolated-query negatives must not be compared with sentence-context queries.
-                let targetSuffix = profile.modelKey == self.pronunciationModelKey ? "" : ":" + self.pronunciationModelKey
-                let evidenceKey = referenceKey + ":shared-features-v1" + targetSuffix
-                guard let query = Self.sharedPronunciationFrames(features, sampleRange: trimmed),
-                      let references = self.temporalReferenceCache[referenceKey] else { continue }
-                guard let decision = await DictionaryExperimentalMatcher.compareSharedFeatures(query: query, references: references, chunked: sharedChunk) else { continue }
-                guard decision.accepted, DictionaryMatcherExperiment.sharedFeaturesEnabled else { continue }
-                if compareNegatives {
-                    let negatives = await DictionaryNegativeExampleStore.shared.frames(entryID: profile.dictionaryEntryID, profileKey: evidenceKey, modelKey: self.pronunciationModelKey)
-                    let allowed = await DictionaryExperimentalMatcher.compareNegative(query: query, references: references, negatives: negatives)
-                    if !allowed, DictionaryMatcherExperiment.compareNegatives,
-                       await DictionaryNegativeExampleStore.shared.revision() == negativeRevision { continue }
-                }
-                try Task.checkCancellation()
-                guard DictionaryMatcherExperiment.sharedFeaturesEnabled else { continue }
-                temporalMatches.insert(TemporalMatchKey(prototypeIndex: match.prototypeIndex, frameRange: alignedFrames))
-                output.append(PronunciationWindowMatch(prototypeIndex: match.prototypeIndex, score: decision.meanRelative, frameRange: alignedFrames))
-                if collectNegatives, DictionaryMatcherExperiment.collectNegatives {
-                    evidence.append(DictionaryAcousticEvidence(id: UUID(), entryID: profile.dictionaryEntryID, label: profile.label, profileKey: evidenceKey, modelKey: self.pronunciationModelKey, sourceWordRange: first..<(last + 1), frames: query))
-                }
-                continue
+            guard !indices.isEmpty else { continue }
+            let range = match.frameRange.lowerBound..<match.frameRange.upperBound
+            guard (used[match.prototypeIndex]?.count ?? 0) < 3,
+                  !(used[match.prototypeIndex] ?? []).contains(where: { $0.overlaps(range) }) else { continue }
+            used[match.prototypeIndex, default: []].append(range)
+            // Words learned from corrections have no recordings; the averaged score decides.
+            let heard = indices.map { words[$0].text }.joined(separator: " ")
+            if DictionaryPronunciationDecision.accepts(score: match.score, heardText: heard, profile: profiles[match.prototypeIndex]) {
+                output.append(match)
             }
         }
         return DictionaryMatcherExperiment.sharedFeaturesEnabled && DictionaryMatcherExperiment.generation == pronunciationGeneration ? output : []
@@ -1458,7 +1472,25 @@ final class FluidAudioProvider: TranscriptionProvider {
             let samples: [Float]
             if let id = capture.inspectionID {
                 let audio = try await self.pronunciationStore.inspection(for: id)
-                samples = Array(audio.samples.prefix(audio.recordedSampleCount))
+                let recorded = Array(audio.samples.prefix(audio.recordedSampleCount))
+                // Encode the whole recording, then keep only the word's frames. The word keeps its
+                // natural surroundings for the encoder, and the reference excludes silence and noise.
+                if let word = DictionaryPronunciationExperiment.wordRange(recorded, words: audio.words),
+                   recorded.count <= 240_000
+                {
+                    let encoded = try await DictionaryTemporalEncoder.encode(recorded, models: models)
+                    guard !encoded.values.isEmpty else { return [] }
+                    let first = min(encoded.count - 1, word.lowerBound / 1280)
+                    let last = min(encoded.count, max(first + 1, (word.upperBound + 1279) / 1280))
+                    let frames = DictionaryMatchFrames(
+                        hiddenSize: encoded.hiddenSize,
+                        values: Array(encoded.values[(first * encoded.hiddenSize)..<(last * encoded.hiddenSize)])
+                    )
+                    guard frames.isValid else { return [] }
+                    result.append(frames)
+                    continue
+                }
+                samples = recorded
             } else if capture.originalAudioID != nil {
                 samples = try await self.pronunciationStore.originalAudioSamples(for: capture, entryID: profile.dictionaryEntryID)
             } else { return [] }
