@@ -7472,13 +7472,28 @@ final class ASRService: ObservableObject {
     }
 
     private static var cachedDictionaryPatterns: [CachedDictionaryPattern] = []
+    private static var cachedBuiltInDictionaryPatterns: [CachedDictionaryPattern] = []
+    private static var cachedUserDictionaryProtections: [NSRegularExpression] = []
     private static var dictionaryCacheNeedsRebuild: Bool = true
 
     /// Rebuilds the regex cache if dictionary has changed.
     /// Called lazily on first apply after settings change.
     private static func rebuildDictionaryCache() {
         let userEntries = SettingsStore.shared.customDictionaryEntries
-        let entries = userEntries + BuiltInDictionary.entries(excludingSpellingsIn: userEntries)
+        self.cachedDictionaryPatterns = self.dictionaryPatterns(for: userEntries)
+        self.cachedBuiltInDictionaryPatterns = self.dictionaryPatterns(for: BuiltInDictionary.entries(excludingSpellingsIn: userEntries))
+        self.cachedUserDictionaryProtections = self.cachedDictionaryPatterns.map(\.regex)
+        var protectedPatterns = Set(self.cachedUserDictionaryProtections.map(\.pattern))
+        for entry in userEntries where !entry.replacement.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let pattern = self.dictionaryPattern(for: entry.replacement)
+            guard protectedPatterns.insert(pattern).inserted,
+                  let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else { continue }
+            self.cachedUserDictionaryProtections.append(regex)
+        }
+        self.dictionaryCacheNeedsRebuild = false
+    }
+
+    private static func dictionaryPatterns(for entries: [SettingsStore.CustomDictionaryEntry]) -> [CachedDictionaryPattern] {
         var patterns: [CachedDictionaryPattern] = []
 
         for entry in entries {
@@ -7514,10 +7529,51 @@ final class ASRService: ObservableObject {
             }
         }
 
-        self.cachedDictionaryPatterns = patterns.sorted {
+        return patterns.sorted {
             $0.regex.pattern.utf16.count > $1.regex.pattern.utf16.count
         }
-        self.dictionaryCacheNeedsRebuild = false
+    }
+
+    /// Apply defaults only outside user-defined phrases and completed user replacements.
+    /// Match against one immutable string so built-in edits cannot move protected ranges.
+    private static func applyBuiltInDictionary(
+        to text: String,
+        onReplacement: (CachedDictionaryPattern, NSRange, String, String) -> Void
+    ) -> String {
+        let fullRange = NSRange(text.startIndex..., in: text)
+        var candidates: [(pattern: CachedDictionaryPattern, match: NSTextCheckingResult)] = []
+        for pattern in self.cachedBuiltInDictionaryPatterns {
+            candidates += pattern.regex.matches(in: text, range: fullRange).map { (pattern, $0) }
+        }
+        guard !candidates.isEmpty else { return text }
+        candidates.sort {
+            if $0.match.range.location != $1.match.range.location { return $0.match.range.location < $1.match.range.location }
+            return $0.match.range.length > $1.match.range.length
+        }
+        let protected = self.cachedUserDictionaryProtections.flatMap {
+            $0.matches(in: text, range: fullRange).map(\.range)
+        }.sorted { $0.location < $1.location }
+        var protectedIndex = 0
+        var previousEnd = 0
+        var accepted: [(pattern: CachedDictionaryPattern, match: NSTextCheckingResult)] = []
+        for candidate in candidates {
+            let range = candidate.match.range
+            while protectedIndex < protected.count, NSMaxRange(protected[protectedIndex]) <= range.location {
+                protectedIndex += 1
+            }
+            guard range.location >= previousEnd,
+                  protectedIndex == protected.count || protected[protectedIndex].location >= NSMaxRange(range) else { continue }
+            accepted.append(candidate)
+            previousEnd = NSMaxRange(range)
+        }
+        let output = NSMutableString(string: text)
+        for (pattern, match) in accepted.reversed() {
+            let replacement = pattern.regex.replacementString(for: match, in: text, offset: 0, template: pattern.template)
+            let heard = (text as NSString).substring(with: match.range)
+            if heard != replacement { onReplacement(pattern, match.range, heard, replacement) }
+            output.replaceCharacters(in: match.range, with: replacement)
+        }
+        return output as String
     }
 
     private static func dictionaryPattern(
@@ -7562,7 +7618,7 @@ final class ASRService: ObservableObject {
             self.rebuildDictionaryCache()
         }
 
-        guard !self.cachedDictionaryPatterns.isEmpty else {
+        guard !self.cachedDictionaryPatterns.isEmpty || !self.cachedBuiltInDictionaryPatterns.isEmpty else {
             return text
         }
 
@@ -7570,6 +7626,21 @@ final class ASRService: ObservableObject {
 
         // Apply cached regexes - O(n) where n = number of patterns
         var replacementCount = 0
+        func recordReplacement(_ pattern: CachedDictionaryPattern, _ range: NSRange, _ heard: String, _ replacement: String) {
+            replacementCount += 1
+            guard replacementCount <= DictionaryReplacementDiagnostics.maximumEvents else { return }
+            DebugLogger.shared.debug(
+                "DICTIONARY_REPLACEMENT stage=exact_rule entryID=\(pattern.entryID) " +
+                    "trigger=\(DictionaryReplacementDiagnostics.quoted(pattern.trigger)) " +
+                    "heard=\(DictionaryReplacementDiagnostics.quoted(heard)) " +
+                    "replacement=\(DictionaryReplacementDiagnostics.quoted(replacement)) " +
+                    "utf16Location=\(range.location) utf16Length=\(range.length)",
+                source: "CustomDictionary"
+            )
+        }
+        // Defaults cannot consume an explicit user phrase. Apply user rules last so a
+        // default's corrected spelling can also follow the user's chosen replacement.
+        result = self.applyBuiltInDictionary(to: result, onReplacement: recordReplacement)
         for pattern in self.cachedDictionaryPatterns {
             result = DictionaryReplacementProtection.replacingMatches(
                 in: result,
@@ -7577,16 +7648,7 @@ final class ASRService: ObservableObject {
                 template: pattern.template,
                 canonical: pattern.canonical,
                 onReplacement: { range, heard, replacement in
-                    replacementCount += 1
-                    guard replacementCount <= DictionaryReplacementDiagnostics.maximumEvents else { return }
-                    DebugLogger.shared.debug(
-                        "DICTIONARY_REPLACEMENT stage=exact_rule entryID=\(pattern.entryID) " +
-                            "trigger=\(DictionaryReplacementDiagnostics.quoted(pattern.trigger)) " +
-                            "heard=\(DictionaryReplacementDiagnostics.quoted(heard)) " +
-                            "replacement=\(DictionaryReplacementDiagnostics.quoted(replacement)) " +
-                            "utf16Location=\(range.location) utf16Length=\(range.length)",
-                        source: "CustomDictionary"
-                    )
+                    recordReplacement(pattern, range, heard, replacement)
                 }
             )
         }

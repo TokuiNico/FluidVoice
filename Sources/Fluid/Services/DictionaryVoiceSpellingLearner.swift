@@ -96,6 +96,11 @@ final class DictionaryVoiceSpellingLearner {
         let existing = entries[entryIndex].triggers.map(DictionaryAudioSpan.normalized)
         guard !trigger.isEmpty, !existing.contains(DictionaryAudioSpan.normalized(trigger)),
               entries[entryIndex].triggers.count < Self.maximumSpellingsPerWord else { return }
+        // A manual rule may have been added while this proposal was waiting. It owns its
+        // spellings and canonical words, including phrases contained in this new spelling.
+        let otherEntries = entries.filter { $0.id != spelling.entryID }
+        let words = trigger.split(whereSeparator: \.isWhitespace).map(String.init)
+        guard DictionaryAudioSpan.textClaimed(words: words, entries: otherEntries).isEmpty else { return }
         entries[entryIndex] = SettingsStore.CustomDictionaryEntry(
             id: entries[entryIndex].id,
             triggers: entries[entryIndex].triggers + [trigger],

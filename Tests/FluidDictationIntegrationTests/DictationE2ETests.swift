@@ -4504,3 +4504,110 @@ extension DictationE2ETests {
         }
     }
 }
+
+extension DictationE2ETests {
+    func testUserPhraseOverridesOnlyTheBuiltInOccurrencesItCovers() {
+        defer { ASRService.invalidateDictionaryCache() }
+        self.withRestoredDefaults(keys: [self.customDictionaryEntriesKey]) {
+            SettingsStore.shared.customDictionaryEntries = [.init(triggers: ["post hoc analysis"], replacement: "post hoc analysis")]
+            ASRService.invalidateDictionaryCache()
+            XCTAssertEqual(
+                ASRService.applyCustomDictionary("🙂 post hoc analysis; log it in post hoc for fluid voice."),
+                "🙂 post hoc analysis; log it in PostHog for FluidVoice."
+            )
+        }
+    }
+
+    func testUserReplacementAndCanonicalSpellingWinOverBuiltIns() {
+        defer { ASRService.invalidateDictionaryCache() }
+        self.withRestoredDefaults(keys: [self.customDictionaryEntriesKey]) {
+            SettingsStore.shared.customDictionaryEntries = [.init(triggers: ["my spelling"], replacement: "clawed")]
+            ASRService.invalidateDictionaryCache()
+            XCTAssertEqual(ASRService.applyCustomDictionary("my spelling; clawed; claud"), "clawed; clawed; Claude")
+
+            SettingsStore.shared.customDictionaryEntries = [.init(triggers: ["hoc"], replacement: "HOC")]
+            ASRService.invalidateDictionaryCache()
+            XCTAssertEqual(ASRService.applyCustomDictionary("post hoc; claud"), "post HOC; Claude")
+        }
+    }
+
+    func testUserRulesCanOverrideTheResultOfABuiltInCorrection() {
+        defer { ASRService.invalidateDictionaryCache() }
+        self.withRestoredDefaults(keys: [self.customDictionaryEntriesKey]) {
+            SettingsStore.shared.customDictionaryEntries = [.init(triggers: ["Claude Code"], replacement: "My Assistant")]
+            ASRService.invalidateDictionaryCache()
+            XCTAssertEqual(ASRService.applyCustomDictionary("open claud code and fluid voice"), "open My Assistant and FluidVoice")
+        }
+    }
+
+    func testOverlappingUserPhrasesBothStayProtectedFromBuiltIns() {
+        defer { ASRService.invalidateDictionaryCache() }
+        self.withRestoredDefaults(keys: [self.customDictionaryEntriesKey]) {
+            SettingsStore.shared.customDictionaryEntries = [
+                .init(triggers: ["first phrase"], replacement: "post hoc analysis"),
+                .init(triggers: ["second phrase"], replacement: "analysis claud"),
+            ]
+            ASRService.invalidateDictionaryCache()
+            XCTAssertEqual(ASRService.applyCustomDictionary("post hoc analysis claud; claud"), "post hoc analysis claud; Claude")
+        }
+    }
+
+    func testRemovingUserRulesRestoresBuiltInDefaultsAfterCacheInvalidation() {
+        defer { ASRService.invalidateDictionaryCache() }
+        self.withRestoredDefaults(keys: [self.customDictionaryEntriesKey]) {
+            SettingsStore.shared.customDictionaryEntries = [.init(triggers: ["post hoc analysis"], replacement: "post hoc analysis")]
+            ASRService.invalidateDictionaryCache()
+            XCTAssertEqual(ASRService.applyCustomDictionary("post hoc analysis"), "post hoc analysis")
+            SettingsStore.shared.customDictionaryEntries = []
+            ASRService.invalidateDictionaryCache()
+            XCTAssertEqual(ASRService.applyCustomDictionary("post hoc analysis"), "PostHog analysis")
+        }
+    }
+
+    func testPendingVoiceLearningYieldsToANewerManualRule() async throws {
+        let target = SettingsStore.CustomDictionaryEntry(triggers: [], replacement: "Snigdham")
+        var entries = [target]
+        var saves: [[SettingsStore.CustomDictionaryEntry]] = []
+        let learner = DictionaryVoiceSpellingLearner(
+            window: .milliseconds(50),
+            isEnabled: { true },
+            canWrite: { true },
+            load: { entries },
+            save: { saves.append($0) }
+        )
+        defer { learner.cancelAll() }
+        learner.propose([.init(entryID: target.id, label: "Snigdham", spelling: "Nickdom?")])
+        entries.append(.init(triggers: ["NICKDOM"], replacement: "Nick Dom"))
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertTrue(saves.isEmpty)
+        XCTAssertEqual(learner.pendingCount, 0)
+    }
+
+    func testVoiceLearningDoesNotClaimAnotherUsersCanonicalWordOrPhrase() async throws {
+        let target = SettingsStore.CustomDictionaryEntry(triggers: [], replacement: "Snigdham")
+        let manual = SettingsStore.CustomDictionaryEntry(triggers: ["nick dome"], replacement: "Nickdom")
+        var saves: [[SettingsStore.CustomDictionaryEntry]] = []
+        let learner = self.voiceLearner(entries: [target, manual]) { saves.append($0) }
+        defer { learner.cancelAll() }
+        learner.propose([
+            .init(entryID: target.id, label: "Snigdham", spelling: "Nickdom"),
+            .init(entryID: target.id, label: "Snigdham", spelling: "nick dome now"),
+        ])
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertTrue(saves.isEmpty)
+        XCTAssertEqual(learner.pendingCount, 0)
+    }
+
+    func testVoiceLearningCanStillSaveAnUnclaimedSpellingWithOtherUserRules() async throws {
+        let target = SettingsStore.CustomDictionaryEntry(triggers: [], replacement: "Snigdham")
+        let other = SettingsStore.CustomDictionaryEntry(triggers: ["cloud"], replacement: "Claude")
+        var saves: [[SettingsStore.CustomDictionaryEntry]] = []
+        let learner = self.voiceLearner(entries: [target, other]) { saves.append($0) }
+        defer { learner.cancelAll() }
+        learner.propose([.init(entryID: target.id, label: "Snigdham", spelling: "Nickdom")])
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(saves.count, 1)
+        XCTAssertEqual(saves.first?.first?.triggers, ["nickdom"])
+        XCTAssertEqual(saves.first?.last, other)
+    }
+}
