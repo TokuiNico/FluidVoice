@@ -4443,3 +4443,44 @@ extension DictationE2ETests {
         XCTAssertTrue(saves.isEmpty, "A renamed word must not inherit a spelling learned for its old name")
     }
 }
+
+#if arch(arm64)
+extension DictationE2ETests {
+    func testGreyZoneVoiceMatchNeedsTheWordsToLookLikeTheWord() {
+        let id = UUID()
+        let profile = PronunciationDictionaryProfile(dictionaryEntryID: id, label: "Snigdham", modelKey: "v3", hiddenSize: 1, enrollments: [])
+        let entry = SettingsStore.CustomDictionaryEntry(id: id, triggers: ["snick them"], replacement: "Snigdham")
+        func result(_ a: String, _ b: String) -> ASRResult {
+            ASRResult(text: "what do you mean by \(a) \(b)", confidence: 1, duration: 3, processingTime: 0, tokenTimings: [
+                TokenTiming(token: "▁what", tokenId: 1, startTime: 0.16, endTime: 0.40, confidence: 1),
+                TokenTiming(token: "▁do", tokenId: 2, startTime: 0.40, endTime: 0.56, confidence: 1),
+                TokenTiming(token: "▁you", tokenId: 3, startTime: 0.56, endTime: 0.64, confidence: 1),
+                TokenTiming(token: "▁mean", tokenId: 4, startTime: 0.64, endTime: 0.80, confidence: 1),
+                TokenTiming(token: "▁by", tokenId: 5, startTime: 0.80, endTime: 0.96, confidence: 1),
+                TokenTiming(token: "▁\(a)", tokenId: 6, startTime: 0.96, endTime: 1.44, confidence: 1),
+                TokenTiming(token: "▁\(b)", tokenId: 7, startTime: 1.44, endTime: 1.60, confidence: 1),
+            ])
+        }
+        let temporal: Set<FluidAudioProvider.TemporalMatchKey> = [.init(prototypeIndex: 0, frameRange: 15..<20)]
+        // Distance 0.17: past the sure cutoff, inside the grey zone.
+        let grey = PronunciationWindowMatch(prototypeIndex: 0, score: 0.83, frameRange: 15..<20)
+        let lookalike = result("sneak", "them")
+        XCTAssertEqual(
+            FluidAudioProvider.applyPronunciationMatches(result: lookalike, matches: [grey], profiles: [profile], labels: [id: "Snigdham"], temporalMatches: temporal, entries: [entry]),
+            "what do you mean by Snigdham"
+        )
+        let unrelated = result("banana", "bread")
+        XCTAssertEqual(
+            FluidAudioProvider.applyPronunciationMatches(result: unrelated, matches: [grey], profiles: [profile], labels: [id: "Snigdham"], temporalMatches: temporal, entries: [entry]),
+            unrelated.text,
+            "A grey-zone sound match must not replace words that look nothing like the word"
+        )
+        // Distance 0.10: sure enough on sound alone.
+        let sure = PronunciationWindowMatch(prototypeIndex: 0, score: 0.90, frameRange: 15..<20)
+        XCTAssertEqual(
+            FluidAudioProvider.applyPronunciationMatches(result: unrelated, matches: [sure], profiles: [profile], labels: [id: "Snigdham"], temporalMatches: temporal, entries: [entry]),
+            "what do you mean by Snigdham"
+        )
+    }
+}
+#endif

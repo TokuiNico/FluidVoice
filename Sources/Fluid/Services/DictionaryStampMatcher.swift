@@ -5,9 +5,16 @@ import Foundation
 /// the dictation (subsequence dynamic time warping). The best stretch may start and end anywhere,
 /// and its length may differ from the recording, so the word can be faster or slower in a sentence.
 nonisolated enum DictionaryStampMatcher {
-    /// Mean per-frame cosine distance along the matched path. Measured on one unusual word:
-    /// real uses scored 0.06-0.10 and the closest sound-alikes 0.18 or more.
-    static let maximumDistance: Float = 0.14
+    // Distance = mean per-frame cosine distance along the matched path (0 identical, 1 unrelated).
+    // Tuned 2026-10-20 on 2,007 checks (5 words x the user's last 500 dictations + test sentences):
+    // real uses 0.03-0.20, deliberate sound-alikes 0.180 and 0.198, ordinary speech never below 0.268.
+    // At these values: 40 of 43 real uses caught, 0 of 1,964 others swapped (a fixed 0.14 caught 32).
+
+    /// Below this, the sound alone is enough to replace.
+    static let sureDistance: Float = 0.16
+    /// Between `sureDistance` and this, replace only if the words also look like the word
+    /// (see `DictionaryAudioSpan.greyZoneMinimumResemblance`). At or above it, never replace.
+    static let greyZoneLimit: Float = 0.175
     static let maximumQueryFrames = 1500
 
     struct Hit: Equatable, Sendable {
@@ -15,7 +22,7 @@ nonisolated enum DictionaryStampMatcher {
         let distance: Float
     }
 
-    /// Up to `limit` non-overlapping stretches of `query` closer than `maximumDistance` to any reference.
+    /// Up to `limit` non-overlapping stretches of `query` closer than `greyZoneLimit` to any reference.
     static func hits(references: [DictionaryMatchFrames], in query: DictionaryMatchFrames, limit: Int = 3) -> [Hit] {
         let m = query.count
         guard m > 0, m <= self.maximumQueryFrames, query.values.count == m * query.hiddenSize,
@@ -36,7 +43,7 @@ nonisolated enum DictionaryStampMatcher {
         var available = [Bool](repeating: true, count: m)
         while hits.count < limit {
             var candidate: Int?
-            for j in 0..<m where available[j] && bestDistance[j] < self.maximumDistance {
+            for j in 0..<m where available[j] && bestDistance[j] < self.greyZoneLimit {
                 if candidate.map({ bestDistance[j] < bestDistance[$0] }) ?? true { candidate = j }
             }
             guard let end = candidate else { break }

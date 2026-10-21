@@ -5,6 +5,9 @@ import Foundation
 /// words, and always a whole run of words that looks like the target, never half of a mishearing.
 nonisolated enum DictionaryAudioSpan {
     private static let maximumRunLength = 5
+    /// In the grey zone the written words must look at least this much like the word or a saved
+    /// spelling (1 = identical). Real grey-zone uses scored 0.57-0.86, e.g. "boob tea" for Booptie.
+    static let greyZoneMinimumResemblance = 0.5
     /// A neighbouring word joins only when it makes the run clearly closer, so a stray letter
     /// shared with the target ("is" + "Nickdom" against "Snigdham") does not pull it in.
     private static let joinMargin = 0.1
@@ -68,6 +71,13 @@ nonisolated enum DictionaryAudioSpan {
             if best.map({ current > $0.score }) ?? true { best = (run, current) }
         }
         return best?.run
+    }
+
+    /// How much a run of words looks like the closest target, 0-1.
+    static func resemblance(words: [String], run: ClosedRange<Int>, targets: [String]) -> Double {
+        guard run.lowerBound >= 0, run.upperBound < words.count else { return 0 }
+        let text = run.map { self.normalized(words[$0]) }.joined()
+        return targets.map { self.similarity(text, self.normalized($0)) }.max() ?? 0
     }
 
     /// 1 for identical text, falling toward 0 as more letters must change.

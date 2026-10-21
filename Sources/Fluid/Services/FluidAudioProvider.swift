@@ -1598,9 +1598,14 @@ final class FluidAudioProvider: TranscriptionProvider {
                 // settle on the whole run of free words that looks most like this word.
                 let touched = wordIndex.substantiallyOverlappingWordIndices(startTime: startTime, endTime: endTime, minimumOverlapRatio: 0)
                 let spellings = entries.first { $0.id == profile.dictionaryEntryID }?.triggers ?? []
-                guard let run = DictionaryAudioSpan.span(
-                    words: words.map(\.text), touched: touched, claimed: textClaimed, targets: [label] + spellings
-                ) else { continue }
+                let targets = [label] + spellings
+                guard let run = DictionaryAudioSpan.span(words: words.map(\.text), touched: touched, claimed: textClaimed, targets: targets)
+                else { continue }
+                // Grey zone: the sound is close but not certain, so the words must also look like the word.
+                if 1 - match.score >= DictionaryStampMatcher.sureDistance,
+                   DictionaryAudioSpan.resemblance(words: words.map(\.text), run: run, targets: targets)
+                   < DictionaryAudioSpan.greyZoneMinimumResemblance
+                { continue }
                 indices = Array(run)
             } else {
                 indices = wordIndex.substantiallyOverlappingWordIndices(startTime: startTime, endTime: endTime)
