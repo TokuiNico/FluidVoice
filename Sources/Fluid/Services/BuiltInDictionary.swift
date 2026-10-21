@@ -7,7 +7,7 @@ nonisolated enum BuiltInDictionary {
     static let entries: [SettingsStore.CustomDictionaryEntry] = [
         .init(triggers: ["claud", "clawed"], replacement: "Claude"),
         .init(triggers: ["post hoc"], replacement: "PostHog"),
-        .init(triggers: ["hugging face"], replacement: "Huggingface"),
+        .init(triggers: ["huggingface", "hugging face"], replacement: "Hugging Face"),
         .init(triggers: ["fluid voice"], replacement: "FluidVoice"),
     ]
 
