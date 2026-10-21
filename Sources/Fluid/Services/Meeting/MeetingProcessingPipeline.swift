@@ -645,7 +645,7 @@ final class MeetingProcessingPipeline: MeetingProcessingControlling {
     /// Bump whenever classification rules change so a resumed run can't mix rules mid-session.
     /// Era-awareness did NOT bump this: the mic pass re-runs every time, and multi-era tracks cannot predate this build.
     /// Version 15: retain unfiltered microphone speech when echo filtering is unavailable.
-    static let pipelineVersion = 15
+    nonisolated static let pipelineVersion = 15
     /// Per-turn engines starve on short turns, and an all-empty chunk collapses to unlabeled.
     static let perTurnTurnMergeGapSeconds = 5.0
 
