@@ -29,7 +29,12 @@ final class DictionaryVoiceSpellingLearner {
         isEnabled: @escaping @MainActor () -> Bool = { SettingsStore.shared.automaticDictionaryLearningEnabled },
         canWrite: @escaping @MainActor () -> Bool = { !AppServices.shared.asr.isRunningOrStarting },
         load: @escaping @MainActor () -> [SettingsStore.CustomDictionaryEntry] = { SettingsStore.shared.customDictionaryEntries },
-        save: @escaping @MainActor ([SettingsStore.CustomDictionaryEntry]) -> Void = { SettingsStore.shared.customDictionaryEntries = $0 }
+        save: @escaping @MainActor ([SettingsStore.CustomDictionaryEntry]) -> Void = {
+            SettingsStore.shared.customDictionaryEntries = $0
+            // The text layer caches compiled rules; without this the learned spelling would not apply yet.
+            // No vocabulary notification: that would restart the speech engine for a text-only change.
+            ASRService.invalidateDictionaryCache()
+        }
     ) {
         self.window = window
         self.isEnabled = isEnabled

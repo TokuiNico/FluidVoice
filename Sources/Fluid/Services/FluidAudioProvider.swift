@@ -274,7 +274,15 @@ final class FluidAudioProvider: TranscriptionProvider {
     private var incrementalSharedFeatures = false
     private var incrementalSharedEvidence: [Int: [(Range<Int>, DictionaryAcousticEvidence)]] = [:]
     private var temporalModels: AsrModels?
-    private var temporalReferenceCache = TemporalReferenceCache()
+    /// Prepared word recordings, per speech model. Saving a dictionary word replaces this provider, so the
+    /// cache lives outside it: otherwise every voice word would be re-encoded after each save, and the next
+    /// dictation would wait for all of them instead of only the new word.
+    private static var sharedTemporalReferenceCaches: [String: TemporalReferenceCache] = [:]
+    private var temporalReferenceCache: TemporalReferenceCache {
+        get { Self.sharedTemporalReferenceCaches[self.pronunciationModelKey] ?? TemporalReferenceCache() }
+        set { Self.sharedTemporalReferenceCaches[self.pronunciationModelKey] = newValue }
+    }
+
     private var temporalWarmTask: Task<Void, Never>?
     private var temporalWarmRequest: (profiles: [PronunciationDictionaryProfile], generation: String)?
     private var pronunciationProfilesToWarm: [PronunciationDictionaryProfile] = []
@@ -1337,7 +1345,7 @@ final class FluidAudioProvider: TranscriptionProvider {
         let negativeRevision = compareNegatives ? await DictionaryNegativeExampleStore.shared.revision() : nil
         // Words recorded in the Add Word screen: slide each recording along the whole dictation.
         // This does not depend on the averaged-window shortlist, which misses words said differently in a sentence.
-        let query = DictionaryMatchFrames(hiddenSize: features.hiddenSize, values: features.values)
+        let query = DictionaryStampMatcher.prepare(DictionaryMatchFrames(hiddenSize: features.hiddenSize, values: features.values))
         // Right after a word is saved, its recordings are still being prepared. A dictation that
         // finishes first would be checked against nothing, so wait briefly for that one preparation.
         let deadline = ContinuousClock.now + .seconds(2)
@@ -1347,15 +1355,22 @@ final class FluidAudioProvider: TranscriptionProvider {
             try await Task.sleep(for: .milliseconds(40))
         }
         var stampedProfiles = Set<String>()
+        var stamped: [(index: Int, profile: PronunciationDictionaryProfile, referenceKey: String, references: [DictionaryMatchFrames])] = []
         for (index, profile) in profiles.enumerated() where profile.hasTemporalRecordings {
-            try Task.checkCancellation()
             let referenceKey = DictionaryNegativeEvidenceResolver.profileKey(profile)
             guard stampedProfiles.insert(referenceKey).inserted,
                   let references = self.temporalReferenceCache[referenceKey] else { continue }
+            stamped.append((index, profile, referenceKey, references))
+        }
+        // One comparison for every recorded word at once; per word it costs a fraction of a millisecond.
+        let stampHits = query.map { DictionaryStampMatcher.hits(words: stamped.map(\.references), in: $0) } ?? []
+        for (word, hits) in zip(stamped, stampHits) {
+            try Task.checkCancellation()
+            let (index, profile, referenceKey, references) = word
             // Old isolated-query negatives must not be compared with sentence-context queries.
             let targetSuffix = profile.modelKey == self.pronunciationModelKey ? "" : ":" + self.pronunciationModelKey
             let evidenceKey = referenceKey + ":shared-features-v1" + targetSuffix
-            for hit in DictionaryStampMatcher.hits(references: references, in: query) {
+            for hit in hits {
                 let indices = wordIndex.substantiallyOverlappingWordIndices(
                     startTime: Double(hit.frames.lowerBound) * 0.08,
                     endTime: Double(hit.frames.upperBound) * 0.08,
