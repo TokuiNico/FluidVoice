@@ -4611,3 +4611,159 @@ extension DictationE2ETests {
         XCTAssertEqual(saves.first?.last, other)
     }
 }
+
+#if arch(arm64)
+extension DictationE2ETests {
+    func testExpandedTemporalMatchKeepsItsCorrectionEvidence() {
+        let id = UUID()
+        let profile = PronunciationDictionaryProfile(dictionaryEntryID: id, label: "Snigdham", modelKey: "v3", hiddenSize: 1, enrollments: [])
+        let result = ASRResult(text: "what do you mean by sneak them", confidence: 1, duration: 3, processingTime: 0, tokenTimings: [
+            TokenTiming(token: "▁what", tokenId: 1, startTime: 0.16, endTime: 0.40, confidence: 1),
+            TokenTiming(token: "▁do", tokenId: 2, startTime: 0.40, endTime: 0.56, confidence: 1),
+            TokenTiming(token: "▁you", tokenId: 3, startTime: 0.56, endTime: 0.64, confidence: 1),
+            TokenTiming(token: "▁mean", tokenId: 4, startTime: 0.64, endTime: 0.80, confidence: 1),
+            TokenTiming(token: "▁by", tokenId: 5, startTime: 0.80, endTime: 0.96, confidence: 1),
+            TokenTiming(token: "▁sneak", tokenId: 6, startTime: 0.96, endTime: 1.44, confidence: 1),
+            TokenTiming(token: "▁them", tokenId: 7, startTime: 1.44, endTime: 1.60, confidence: 1),
+        ])
+        let hit = PronunciationWindowMatch(prototypeIndex: 0, score: 0.94, frameRange: 18..<20)
+        let evidence = DictionaryAcousticEvidence(
+            id: UUID(),
+            entryID: id,
+            label: "Snigdham",
+            profileKey: "fixture",
+            modelKey: "v3",
+            sourceWordRange: 6..<7,
+            frames: .init(hiddenSize: 1, values: [1, 2]),
+            matchFrameRange: hit.frameRange
+        )
+        var accepted: [DictionaryAcousticEvidence] = []
+        let text = FluidAudioProvider.applyPronunciationMatches(
+            result: result,
+            matches: [hit],
+            profiles: [profile],
+            labels: [id: "Snigdham"],
+            temporalMatches: [.init(prototypeIndex: 0, frameRange: hit.frameRange)],
+            entries: [.init(id: id, triggers: ["snick them"], replacement: "Snigdham")],
+            onAccepted: { entryID, label, range, frames in
+                accepted += FluidAudioProvider.acceptedAcousticEvidence(
+                    [evidence],
+                    entryID: entryID,
+                    label: label,
+                    wordRange: range,
+                    frameRange: frames
+                )
+            }
+        )
+        XCTAssertEqual(text, "what do you mean by Snigdham")
+        XCTAssertEqual(accepted.count, 1)
+        XCTAssertEqual(accepted.first?.sourceWordRange, 5..<7)
+    }
+}
+#endif
+
+extension DictationE2ETests {
+    func testVoiceSpellingObservationCoversConfirmationAndEditDebounce() {
+        XCTAssertGreaterThan(
+            AutomaticDictionaryCorrectionTracker.observationDuration(hasVoiceSpellings: true),
+            DictionaryVoiceSpellingLearner.confirmationWindow
+        )
+        XCTAssertEqual(AutomaticDictionaryCorrectionTracker.observationDuration(hasVoiceSpellings: false), .seconds(30))
+    }
+
+    func testEndingObservationCancelsOnlyThatRecordingsUnconfirmedSpellings() async throws {
+        let first = SettingsStore.CustomDictionaryEntry(triggers: [], replacement: "Snigdham")
+        let second = SettingsStore.CustomDictionaryEntry(triggers: [], replacement: "Velora")
+        let firstRecording = UUID()
+        let secondRecording = UUID()
+        var entries = [first, second]
+        var saves = 0
+        let learner = DictionaryVoiceSpellingLearner(
+            window: .milliseconds(50),
+            isEnabled: { true },
+            canWrite: { true },
+            load: { entries },
+            save: { entries = $0; saves += 1 }
+        )
+        defer { learner.cancelAll() }
+        learner.propose([.init(entryID: first.id, label: first.replacement, spelling: "Nickdom")], recordingID: firstRecording)
+        learner.propose([.init(entryID: second.id, label: second.replacement, spelling: "velorra")], recordingID: secondRecording)
+        learner.cancel(recordingID: firstRecording)
+        learner.cancel(recordingID: firstRecording)
+        XCTAssertEqual(learner.pendingCount, 1)
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(saves, 1)
+        XCTAssertTrue(entries[0].triggers.isEmpty)
+        XCTAssertEqual(entries[1].triggers, ["velorra"])
+        XCTAssertEqual(learner.pendingCount, 0)
+    }
+
+    func testEndingObservationCannotSaveARuleWhileWaitingForCaptureToFinish() async throws {
+        let entry = SettingsStore.CustomDictionaryEntry(triggers: [], replacement: "Snigdham")
+        let recordingID = UUID()
+        var canWrite = false
+        var saves = 0
+        let learner = self.voiceLearner(entries: [entry], saved: { _ in saves += 1 }, canWrite: { canWrite })
+        defer { learner.cancelAll() }
+        learner.propose([.init(entryID: entry.id, label: entry.replacement, spelling: "Nickdom")], recordingID: recordingID)
+        try await Task.sleep(for: .milliseconds(100))
+        learner.cancel(recordingID: recordingID)
+        canWrite = true
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(learner.pendingCount, 0)
+        XCTAssertEqual(saves, 0)
+    }
+}
+
+#if arch(arm64)
+extension DictationE2ETests {
+    func testCorrectionEvidenceAlignsBothGrowingAndShrinkingWordRangesWithoutMixingHits() {
+        let id = UUID()
+        let chosen = DictionaryAcousticEvidence(
+            id: UUID(),
+            entryID: id,
+            label: "Name",
+            profileKey: "profile",
+            modelKey: "v3",
+            sourceWordRange: 1..<3,
+            frames: .init(hiddenSize: 1, values: [1, 2]),
+            matchFrameRange: 4..<6
+        )
+        let otherHit = DictionaryAcousticEvidence(
+            id: UUID(),
+            entryID: id,
+            label: "Name",
+            profileKey: "profile",
+            modelKey: "v3",
+            sourceWordRange: 1..<3,
+            frames: .init(hiddenSize: 1, values: [3, 4]),
+            matchFrameRange: 8..<10
+        )
+        let otherWord = DictionaryAcousticEvidence(
+            id: UUID(),
+            entryID: UUID(),
+            label: "Other",
+            profileKey: "other",
+            modelKey: "v3",
+            sourceWordRange: 1..<3,
+            frames: .init(hiddenSize: 1, values: [5, 6]),
+            matchFrameRange: 4..<6
+        )
+        for finalRange in [1..<2, 0..<4] {
+            let result = FluidAudioProvider.acceptedAcousticEvidence(
+                [chosen, otherHit, otherWord],
+                entryID: id,
+                label: "Name's",
+                wordRange: finalRange,
+                frameRange: 4..<6
+            )
+            XCTAssertEqual(result.count, 1)
+            XCTAssertEqual(result.first?.id, chosen.id)
+            XCTAssertEqual(result.first?.sourceWordRange, finalRange)
+            XCTAssertEqual(result.first?.label, "Name's")
+            XCTAssertEqual(result.first?.frames.values, chosen.frames.values)
+            XCTAssertEqual(result.first?.profileKey, chosen.profileKey)
+        }
+    }
+}
+#endif

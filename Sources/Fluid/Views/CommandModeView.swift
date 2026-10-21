@@ -310,7 +310,6 @@ struct CommandModeView: View {
                     }
                     .frame(maxHeight: 150)
                 }
-                .disclosureGroupStyle(FluidDisclosureGroupStyle())
                 .font(self.theme.typography.caption)
             }
             if !self.service.streamingText.isEmpty {

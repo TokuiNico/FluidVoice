@@ -14,6 +14,7 @@ final class DictionaryVoiceSpellingLearner {
     private struct Pending {
         let id: UUID
         let spelling: DictionaryVoiceSpelling
+        let recordingID: UUID?
         let task: Task<Void, Never>
     }
 
@@ -46,7 +47,7 @@ final class DictionaryVoiceSpellingLearner {
     var pendingCount: Int { self.pending.count }
 
     /// Called once the dictation has been delivered where its edits can be observed.
-    func propose(_ spellings: [DictionaryVoiceSpelling]) {
+    func propose(_ spellings: [DictionaryVoiceSpelling], recordingID: UUID? = nil) {
         guard self.isEnabled() else { return }
         for spelling in spellings where Self.isLearnable(spelling) {
             guard self.pending.count < Self.maximumPending,
@@ -55,7 +56,7 @@ final class DictionaryVoiceSpellingLearner {
             let window = self.window
             let task = Task { @MainActor [weak self] in
                 do { try await Task.sleep(for: window) } catch { return }
-                // A dictionary write reloads the speech model, so never do it mid-recording.
+                // Keep learned-rule writes outside an active capture.
                 for _ in 0..<30 {
                     guard let self, !Task.isCancelled else { return }
                     if self.canWrite() { break }
@@ -63,7 +64,7 @@ final class DictionaryVoiceSpellingLearner {
                 }
                 self?.commit(id)
             }
-            self.pending.append(Pending(id: id, spelling: spelling, task: task))
+            self.pending.append(Pending(id: id, spelling: spelling, recordingID: recordingID, task: task))
         }
     }
 
@@ -81,6 +82,14 @@ final class DictionaryVoiceSpellingLearner {
     func cancelAll() {
         self.pending.forEach { $0.task.cancel() }
         self.pending.removeAll()
+    }
+
+    /// An unobserved field cannot confirm that its replacements were kept.
+    func cancel(recordingID: UUID) {
+        for item in self.pending where item.recordingID == recordingID {
+            item.task.cancel()
+        }
+        self.pending.removeAll { $0.recordingID == recordingID }
     }
 
     private func commit(_ id: UUID) {

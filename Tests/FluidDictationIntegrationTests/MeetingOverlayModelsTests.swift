@@ -827,3 +827,50 @@ final class MeetingPageActionAvailabilityTests: XCTestCase {
         }
     }
 }
+
+@MainActor
+extension MeetingMenuBarStartTests {
+    func testSavedOnlineApplicationIsUsedWithoutAutomaticDetection() throws {
+        var defaults = MeetingRecordingDefaults.unconfigured
+        defaults.isConfigured = true
+        defaults.applicationBundleIdentifier = "us.zoom.xos"
+        let app = MeetingApplicationIdentity(bundleIdentifier: "us.zoom.xos", processID: 42, displayName: "Zoom")
+        let config = try self.savedSourceConfiguration(defaults: defaults, applications: [app])
+        XCTAssertEqual(config.mode, .onlineCall)
+        XCTAssertEqual(config.application, app)
+        XCTAssertEqual(config.platform?.identifier, app.bundleIdentifier)
+    }
+
+    func testUnavailableSavedApplicationCannotSilentlyBecomeMicrophoneOnly() {
+        var defaults = MeetingRecordingDefaults.unconfigured
+        defaults.isConfigured = true
+        defaults.applicationBundleIdentifier = "us.zoom.xos"
+        XCTAssertThrowsError(try self.savedSourceConfiguration(defaults: defaults, applications: [
+            MeetingApplicationIdentity(bundleIdentifier: "com.microsoft.teams2", processID: 43, displayName: "Teams"),
+        ]))
+    }
+
+    func testSavedInRoomModeDoesNotCaptureASavedApplication() throws {
+        var defaults = MeetingRecordingDefaults.unconfigured
+        defaults.isConfigured = true
+        defaults.mode = .inRoom
+        defaults.applicationBundleIdentifier = "us.zoom.xos"
+        let app = MeetingApplicationIdentity(bundleIdentifier: "us.zoom.xos", processID: 42, displayName: "Zoom")
+        let config = try self.savedSourceConfiguration(defaults: defaults, applications: [app])
+        XCTAssertEqual(config.mode, .inRoom)
+        XCTAssertNil(config.application)
+    }
+
+    private func savedSourceConfiguration(
+        defaults: MeetingRecordingDefaults,
+        applications: [MeetingApplicationIdentity]
+    ) throws -> MeetingCaptureConfiguration {
+        try AppServices.menuBarMeetingConfiguration(
+            defaults: defaults,
+            target: nil,
+            microphones: .init(identities: [.init(captureDeviceID: "mic", displayName: "Mic")], defaultCoreAudioUID: nil),
+            applications: applications,
+            preferredInputUID: nil
+        )
+    }
+}

@@ -3538,7 +3538,6 @@ struct ContentView: View {
                     targetPID: typingTarget.pid,
                     learningRecording: dictionaryLearningRecording
                 )
-                DictionaryVoiceSpellingLearner.shared.propose(dictionaryLearningRecording?.alignment.voiceSpellings ?? [])
                 self.appBench("dictionary_tracking_scheduled afterDeliveryUI=true")
             }
         }
@@ -4898,7 +4897,9 @@ struct ContentView: View {
     private func beginCommandRecording() async {
         guard self.canBeginDictationRecording() else { return }
         DebugLogger.shared.info("Command mode triggered", source: "ContentView")
-        self.captureRecordingContext()
+        DictationStopSnapshot.captureStartingContext(reusingCapture: self.canSwitchActiveDictationCaptureMode) {
+            self.captureRecordingContext()
+        }
 
         // Set flag so stopAndProcessTranscription knows to process as command
         self.setActiveRecordingMode(.command)
@@ -4941,7 +4942,9 @@ struct ContentView: View {
     private func beginRewriteRecording() async {
         guard self.canBeginDictationRecording() else { return }
 
-        self.captureRecordingContext()
+        DictationStopSnapshot.captureStartingContext(reusingCapture: self.canSwitchActiveDictationCaptureMode) {
+            self.captureRecordingContext()
+        }
 
         // Try to capture text first while still in the other app
         let captured = self.rewriteModeService.captureSelectedText()

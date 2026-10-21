@@ -989,7 +989,16 @@ final class FluidAudioProvider: TranscriptionProvider {
                 for (frames, item) in items {
                     let indices = wordIndex.substantiallyOverlappingWordIndices(startTime: Double(frames.lowerBound) * 0.08, endTime: Double(frames.upperBound) * 0.08, minimumOverlapRatio: 0)
                     guard let first = indices.first, let last = indices.last else { continue }
-                    acousticEvidence.append(DictionaryAcousticEvidence(id: item.id, entryID: item.entryID, label: item.label, profileKey: item.profileKey, modelKey: item.modelKey, sourceWordRange: first..<(last + 1), frames: item.frames))
+                    acousticEvidence.append(DictionaryAcousticEvidence(
+                        id: item.id,
+                        entryID: item.entryID,
+                        label: item.label,
+                        profileKey: item.profileKey,
+                        modelKey: item.modelKey,
+                        sourceWordRange: first..<(last + 1),
+                        frames: item.frames,
+                        matchFrameRange: frames
+                    ))
                 }
             }
         } else if let manager = self.finalAsrManager ?? self.streamingAsrManager, originalText == result.text {
@@ -1005,8 +1014,8 @@ final class FluidAudioProvider: TranscriptionProvider {
                 labels: Self.dictionaryLabels(from: self.effectiveCustomDictionaryEntries).filter { eligibleIDs.contains($0.key) },
                 temporalMatches: temporalMatches,
                 entries: self.effectiveCustomDictionaryEntries + BuiltInDictionary.entries,
-                onAccepted: { id, label, range in
-                    acceptedEvidence += acousticEvidence.filter { $0.entryID == id && $0.label == label && $0.sourceWordRange == range }
+                onAccepted: { id, label, range, frames in
+                    acceptedEvidence += Self.acceptedAcousticEvidence(acousticEvidence, entryID: id, label: label, wordRange: range, frameRange: frames)
                 },
                 onReplaced: { voiceSpellings.append($0) }
             ) : result.text
@@ -1254,8 +1263,8 @@ final class FluidAudioProvider: TranscriptionProvider {
                 labels: Self.dictionaryLabels(from: self.effectiveCustomDictionaryEntries),
                 temporalMatches: temporalMatches,
                 entries: self.effectiveCustomDictionaryEntries + BuiltInDictionary.entries,
-                onAccepted: { id, label, range in
-                    acceptedEvidence += acousticEvidence.filter { $0.entryID == id && $0.label == label && $0.sourceWordRange == range }
+                onAccepted: { id, label, range, frames in
+                    acceptedEvidence += Self.acceptedAcousticEvidence(acousticEvidence, entryID: id, label: label, wordRange: range, frameRange: frames)
                 },
                 onReplaced: { voiceSpellings.append($0) }
             )
@@ -1399,7 +1408,8 @@ final class FluidAudioProvider: TranscriptionProvider {
                         profileKey: evidenceKey,
                         modelKey: self.pronunciationModelKey,
                         sourceWordRange: first..<(last + 1),
-                        frames: hitFrames
+                        frames: hitFrames,
+                        matchFrameRange: hit.frames
                     ))
                 }
                 DebugLogger.shared.info(
@@ -1572,6 +1582,14 @@ final class FluidAudioProvider: TranscriptionProvider {
         return capture
     }
 
+    /// Keep the selected acoustic hit's identity while aligning its rough word times to the final replacement.
+    static func acceptedAcousticEvidence(
+        _ evidence: [DictionaryAcousticEvidence], entryID: UUID, label: String, wordRange: Range<Int>, frameRange: Range<Int>
+    ) -> [DictionaryAcousticEvidence] {
+        evidence.filter { $0.entryID == entryID && $0.matchFrameRange == frameRange }
+            .map { $0.aligned(to: wordRange, label: label) }
+    }
+
     static func applyPronunciationMatches(
         result: ASRResult,
         matches: [PronunciationWindowMatch],
@@ -1579,7 +1597,7 @@ final class FluidAudioProvider: TranscriptionProvider {
         labels: [UUID: String],
         temporalMatches: Set<TemporalMatchKey> = [],
         entries: [SettingsStore.CustomDictionaryEntry] = [],
-        onAccepted: ((UUID, String, Range<Int>) -> Void)? = nil,
+        onAccepted: ((UUID, String, Range<Int>, Range<Int>) -> Void)? = nil,
         onReplaced: ((DictionaryVoiceSpelling) -> Void)? = nil
     ) -> String {
         guard let timings = result.tokenTimings else { return result.text }
@@ -1595,6 +1613,7 @@ final class FluidAudioProvider: TranscriptionProvider {
             let label: String
             let score: Float
             let wordIndices: [Int]
+            let frameRange: Range<Int>
         }
         var candidates: [Candidate] = []
         for match in matches {
@@ -1636,7 +1655,7 @@ final class FluidAudioProvider: TranscriptionProvider {
                     label, heardText: heard, profile: profile
                 )
             }
-            candidates.append(Candidate(entryID: profile.dictionaryEntryID, label: correctedLabel, score: match.score, wordIndices: indices))
+            candidates.append(Candidate(entryID: profile.dictionaryEntryID, label: correctedLabel, score: match.score, wordIndices: indices, frameRange: match.frameRange))
         }
 
         var leaders: [Int: [(label: String, score: Float)]] = [:]
@@ -1674,7 +1693,7 @@ final class FluidAudioProvider: TranscriptionProvider {
             guard let first = candidate.wordIndices.first, let last = candidate.wordIndices.last else { return nil }
             let heard = candidate.wordIndices.map { words[$0].text }.joined(separator: " ")
             if DictionaryNegativeEvidenceResolver.normalized(heard) != DictionaryNegativeEvidenceResolver.normalized(candidate.label) {
-                onAccepted?(candidate.entryID, candidate.label, first..<(last + 1))
+                onAccepted?(candidate.entryID, candidate.label, first..<(last + 1), candidate.frameRange)
                 onReplaced?(DictionaryVoiceSpelling(entryID: candidate.entryID, label: candidate.label, spelling: heard))
             }
             return PronunciationTextReplacement(wordRange: first...last, label: candidate.label)

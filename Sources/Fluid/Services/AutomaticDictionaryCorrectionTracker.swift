@@ -183,7 +183,11 @@ final class AutomaticDictionaryCorrectionTracker {
     private static let maximumFieldLength = 100_000
     private static let verificationAttempts = 20
     private static let verificationDelayNanoseconds: UInt64 = 50_000_000
-    private static let observationDurationNanoseconds: UInt64 = 30_000_000_000
+    nonisolated static func observationDuration(hasVoiceSpellings: Bool) -> Duration {
+        // Keep observing through confirmation and the edit debounce. Ordinary dictations stay short.
+        hasVoiceSpellings ? DictionaryVoiceSpellingLearner.confirmationWindow + .seconds(5) : .seconds(30)
+    }
+
     private static let completionSignalDelayNanoseconds: UInt64 = 1_000_000_000
     private static let inactivityFallbackNanoseconds: UInt64 = 3_000_000_000
 
@@ -231,14 +235,7 @@ final class AutomaticDictionaryCorrectionTracker {
         self.suggestionGeneration = UUID()
         self.evidencePreparationTask?.cancel()
         self.evidencePreparationTask = nil
-        self.verificationTask?.cancel()
-        self.verificationTask = nil
-        self.timeoutTask?.cancel()
-        self.timeoutTask = nil
-        self.debounceTask?.cancel()
-        self.debounceTask = nil
-        self.removeObserver()
-        self.session = nil
+        self.stopObservation()
         DictionaryCorrectionOverlayController.shared.hide()
     }
 
@@ -265,6 +262,11 @@ final class AutomaticDictionaryCorrectionTracker {
             insertedRange: session.insertedRange,
             allowsInsertionAtEnd: allowsInsertionAtEnd
         )
+
+        // Reject on the edit event, before the debounce can race the confirmation deadline.
+        if isInside, let recording = session.learningRecording {
+            DictionaryVoiceSpellingLearner.shared.cancel(recordingID: recording.id)
+        }
 
         if var pending = session.pendingCorrection {
             let continuesCandidate = pending.correctedRange.map {
@@ -453,8 +455,12 @@ final class AutomaticDictionaryCorrectionTracker {
         )
         CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(createdObserver), .commonModes)
 
+        if let learningRecording {
+            DictionaryVoiceSpellingLearner.shared.propose(learningRecording.alignment.voiceSpellings, recordingID: learningRecording.id)
+        }
+        let duration = Self.observationDuration(hasVoiceSpellings: learningRecording?.alignment.voiceSpellings.isEmpty == false)
         self.timeoutTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: Self.observationDurationNanoseconds)
+            try? await Task.sleep(for: duration)
             guard !Task.isCancelled else { return }
             self?.cancel()
         }
@@ -621,6 +627,9 @@ final class AutomaticDictionaryCorrectionTracker {
     }
 
     private func stopObservation() {
+        if let recording = self.session?.learningRecording {
+            DictionaryVoiceSpellingLearner.shared.cancel(recordingID: recording.id)
+        }
         self.verificationTask?.cancel()
         self.verificationTask = nil
         self.timeoutTask?.cancel()

@@ -25,6 +25,32 @@ private struct PromptCardModelPicker {
     let onOpenProviders: () -> Void
 }
 
+private struct PromptAdvancedDisclosureStyle: DisclosureGroupStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                configuration.isExpanded.toggle()
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: configuration.isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 11, weight: .semibold))
+                        .frame(width: 14)
+                        .accessibilityHidden(true)
+                    configuration.label
+                }
+                .padding(.vertical, 8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityValue(configuration.isExpanded ? "Expanded" : "Collapsed")
+            if configuration.isExpanded {
+                configuration.content
+            }
+        }
+    }
+}
+
 extension AIEnhancementSettingsView {
     // MARK: - Advanced Settings Card
 
@@ -1125,7 +1151,7 @@ extension AIEnhancementSettingsView {
                             }
                         }
                     }
-                    .disclosureGroupStyle(FluidDisclosureGroupStyle())
+                    .disclosureGroupStyle(PromptAdvancedDisclosureStyle())
                 }
                 .padding(16)
                 .background(self.theme.palette.cardBackground, in: RoundedRectangle(cornerRadius: 16))
