@@ -1490,9 +1490,11 @@ final class FluidAudioProvider: TranscriptionProvider {
                     guard !encoded.values.isEmpty else { return [] }
                     let first = min(encoded.count - 1, word.lowerBound / 1280)
                     let last = min(encoded.count, max(first + 1, (word.upperBound + 1279) / 1280))
+                    let hidden = encoded.hiddenSize
+                    let spoken = DictionaryPronunciationExperiment.spokenFrames(recorded, frames: first..<last)
                     let frames = DictionaryMatchFrames(
-                        hiddenSize: encoded.hiddenSize,
-                        values: Array(encoded.values[(first * encoded.hiddenSize)..<(last * encoded.hiddenSize)])
+                        hiddenSize: hidden,
+                        values: spoken.flatMap { encoded.values[($0 * hidden)..<(($0 + 1) * hidden)] }
                     )
                     guard frames.isValid else { return [] }
                     result.append(frames)

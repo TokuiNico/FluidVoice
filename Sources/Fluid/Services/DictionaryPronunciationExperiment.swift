@@ -56,6 +56,19 @@ nonisolated enum DictionaryPronunciationExperiment {
         return start < end ? start..<end : nil
     }
 
+    /// Encoder frames (1280 samples each) that contain speech. Words recorded slowly, such as
+    /// "Slides… A… I", carry pauses that vanish when the same word is said quickly in a sentence.
+    static func spokenFrames(_ samples: [Float], frames: Range<Int>) -> [Int] {
+        let levels = frames.map { frame -> Float in
+            let lower = min(samples.count, frame * 1280), upper = min(samples.count, lower + 1280)
+            guard upper > lower else { return 0 }
+            return sqrt(samples[lower..<upper].reduce(Float(0)) { $0 + $1 * $1 } / Float(upper - lower))
+        }
+        let gate = max((levels.max() ?? 0) * 0.08, 1e-4)
+        let spoken = zip(frames, levels).filter { $0.1 > gate }.map(\.0)
+        return spoken.count >= 3 ? spoken : Array(frames)
+    }
+
     // swiftlint:disable:next discouraged_optional_collection
     static func normalized(_ values: [Float]) -> [Float]? {
         guard !values.isEmpty, values.allSatisfy(\.isFinite) else { return nil }

@@ -4331,3 +4331,14 @@ extension DictationE2ETests {
         XCTAssertNil(DictionaryPronunciationExperiment.wordRange(samples, words: []))
     }
 }
+
+extension DictationE2ETests {
+    func testSpokenFramesDropPausesInsideASlowlySpokenWord() {
+        let loud = (0..<1280).map { Float(sin(Double($0) * 0.3) * 0.2) }
+        let quiet = [Float](repeating: 0.0005, count: 1280)
+        let samples = loud + loud + quiet + quiet + loud + loud
+        XCTAssertEqual(DictionaryPronunciationExperiment.spokenFrames(samples, frames: 0..<6), [0, 1, 4, 5])
+        // Too little speech to trust: keep every frame rather than an almost empty reference.
+        XCTAssertEqual(DictionaryPronunciationExperiment.spokenFrames(loud + quiet + quiet, frames: 0..<3), [0, 1, 2])
+    }
+}
