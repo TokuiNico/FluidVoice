@@ -988,6 +988,7 @@ final class FluidAudioProvider: TranscriptionProvider {
             matches = try await self.refineEdgeMatches(matches, profiles: profiles, samples: samples, manager: manager, transcript: result.text, timings: result.tokenTimings ?? [], evidence: &acousticEvidence, temporalMatches: &temporalMatches)
         }
         try self.requireCurrentRecording(generation)
+        var voiceSpellings: [DictionaryVoiceSpelling] = []
         let text = self.effectivePronunciationMatchingEnabled && originalText == result.text
             ? Self.applyPronunciationMatches(
                 result: result,
@@ -998,7 +999,8 @@ final class FluidAudioProvider: TranscriptionProvider {
                 entries: self.effectiveCustomDictionaryEntries,
                 onAccepted: { id, label, range in
                     acceptedEvidence += acousticEvidence.filter { $0.entryID == id && $0.label == label && $0.sourceWordRange == range }
-                }
+                },
+                onReplaced: { voiceSpellings.append($0) }
             ) : result.text
         let finishFinishedAt = ProcessInfo.processInfo.systemUptime
         DebugLogger.shared.debug(
@@ -1011,6 +1013,7 @@ final class FluidAudioProvider: TranscriptionProvider {
         var alignment = self.learningAlignment(for: result)
         alignment?.acousticOutput = text
         alignment?.acousticEvidence = acceptedEvidence
+        alignment?.voiceSpellings = voiceSpellings
         return ASRTranscriptionResult(
             text: text,
             confidence: result.confidence,
@@ -1235,6 +1238,7 @@ final class FluidAudioProvider: TranscriptionProvider {
                 temporalMatches: &temporalMatches,
                 features: features
             )
+            var voiceSpellings: [DictionaryVoiceSpelling] = []
             let corrected = Self.applyPronunciationMatches(
                 result: result,
                 matches: DictionaryMatcherExperiment.sharedFeaturesEnabled ? refined : [],
@@ -1244,11 +1248,13 @@ final class FluidAudioProvider: TranscriptionProvider {
                 entries: self.effectiveCustomDictionaryEntries,
                 onAccepted: { id, label, range in
                     acceptedEvidence += acousticEvidence.filter { $0.entryID == id && $0.label == label && $0.sourceWordRange == range }
-                }
+                },
+                onReplaced: { voiceSpellings.append($0) }
             )
             var alignment = self.learningAlignment(for: result)
             alignment?.acousticOutput = corrected
             alignment?.acousticEvidence = acceptedEvidence
+            alignment?.voiceSpellings = voiceSpellings
             return (
                 ASRTranscriptionResult(
                     text: corrected,
@@ -1558,7 +1564,8 @@ final class FluidAudioProvider: TranscriptionProvider {
         labels: [UUID: String],
         temporalMatches: Set<TemporalMatchKey> = [],
         entries: [SettingsStore.CustomDictionaryEntry] = [],
-        onAccepted: ((UUID, String, Range<Int>) -> Void)? = nil
+        onAccepted: ((UUID, String, Range<Int>) -> Void)? = nil,
+        onReplaced: ((DictionaryVoiceSpelling) -> Void)? = nil
     ) -> String {
         guard let timings = result.tokenTimings else { return result.text }
         let words = WordAudioChunkExtractor.words(from: timings)
@@ -1648,6 +1655,7 @@ final class FluidAudioProvider: TranscriptionProvider {
             let heard = candidate.wordIndices.map { words[$0].text }.joined(separator: " ")
             if DictionaryNegativeEvidenceResolver.normalized(heard) != DictionaryNegativeEvidenceResolver.normalized(candidate.label) {
                 onAccepted?(candidate.entryID, candidate.label, first..<(last + 1))
+                onReplaced?(DictionaryVoiceSpelling(entryID: candidate.entryID, label: candidate.label, spelling: heard))
             }
             return PronunciationTextReplacement(wordRange: first...last, label: candidate.label)
         }

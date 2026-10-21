@@ -4399,3 +4399,47 @@ extension DictationE2ETests {
     }
     #endif
 }
+
+extension DictationE2ETests {
+    private func voiceLearner(
+        entries: [SettingsStore.CustomDictionaryEntry],
+        saved: @escaping ([SettingsStore.CustomDictionaryEntry]) -> Void,
+        canWrite: @escaping () -> Bool = { true }
+    ) -> DictionaryVoiceSpellingLearner {
+        DictionaryVoiceSpellingLearner(window: .milliseconds(50), isEnabled: { true }, canWrite: canWrite, load: { entries }, save: saved)
+    }
+
+    func testVoiceSpellingIsSavedWhenTheUserKeepsTheReplacement() async throws {
+        let entry = SettingsStore.CustomDictionaryEntry(triggers: ["snick them"], replacement: "Snigdham")
+        var saves: [[SettingsStore.CustomDictionaryEntry]] = []
+        let learner = self.voiceLearner(entries: [entry]) { saves.append($0) }
+        learner.propose([DictionaryVoiceSpelling(entryID: entry.id, label: "Snigdham", spelling: "Nickdom?")])
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(saves.first?.first?.triggers, ["snick them", "nickdom"])
+        XCTAssertEqual(saves.first?.first?.id, entry.id, "The same dictionary word gains the spelling")
+        XCTAssertEqual(learner.pendingCount, 0)
+    }
+
+    func testVoiceSpellingIsDroppedWhenTheUserEditsTheWord() async throws {
+        let entry = SettingsStore.CustomDictionaryEntry(triggers: [], replacement: "Snigdham")
+        var saves: [[SettingsStore.CustomDictionaryEntry]] = []
+        let learner = self.voiceLearner(entries: [entry]) { saves.append($0) }
+        learner.propose([DictionaryVoiceSpelling(entryID: entry.id, label: "Snigdham", spelling: "Nickdom")])
+        learner.reject(editedText: "Snigdham")
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertTrue(saves.isEmpty)
+        XCTAssertEqual(learner.pendingCount, 0)
+    }
+
+    func testVoiceSpellingNeverLearnsCommonWordsTheWordItselfOrForAChangedEntry() async throws {
+        let entry = SettingsStore.CustomDictionaryEntry(triggers: [], replacement: "Snigdham")
+        XCTAssertFalse(DictionaryVoiceSpellingLearner.isLearnable(.init(entryID: entry.id, label: "Snigdham", spelling: "the")))
+        XCTAssertFalse(DictionaryVoiceSpellingLearner.isLearnable(.init(entryID: entry.id, label: "Snigdham", spelling: "snigdham.")))
+        var saves: [[SettingsStore.CustomDictionaryEntry]] = []
+        let renamed = SettingsStore.CustomDictionaryEntry(id: entry.id, triggers: [], replacement: "Snigdha")
+        let learner = self.voiceLearner(entries: [renamed]) { saves.append($0) }
+        learner.propose([DictionaryVoiceSpelling(entryID: entry.id, label: "Snigdham", spelling: "Nickdom")])
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertTrue(saves.isEmpty, "A renamed word must not inherit a spelling learned for its old name")
+    }
+}

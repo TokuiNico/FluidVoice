@@ -483,6 +483,9 @@ final class AutomaticDictionaryCorrectionTracker {
             insertedRange: pending.insertedRange,
             allowsInsertionAtEnd: true
         )
+        if let candidate {
+            DictionaryVoiceSpellingLearner.shared.reject(editedText: candidate.heardText)
+        }
         var context: DictionaryLearningCorrectionContext?
         if DictionaryMatcherExperiment.sharedFeaturesEnabled, let recording = self.session?.learningRecording, let range = candidate?.sourceUTF16Range {
             let before = pending.beforeValue as NSString

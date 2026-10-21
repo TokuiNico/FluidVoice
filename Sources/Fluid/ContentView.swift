@@ -3538,6 +3538,7 @@ struct ContentView: View {
                     targetPID: typingTarget.pid,
                     learningRecording: dictionaryLearningRecording
                 )
+                DictionaryVoiceSpellingLearner.shared.propose(dictionaryLearningRecording?.alignment.voiceSpellings ?? [])
                 self.appBench("dictionary_tracking_scheduled afterDeliveryUI=true")
             }
         }
