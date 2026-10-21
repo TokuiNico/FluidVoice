@@ -4484,3 +4484,23 @@ extension DictationE2ETests {
     }
 }
 #endif
+
+extension DictationE2ETests {
+    func testBuiltInDictionaryAppliesWithoutUserEntriesAndUserSpellingsWin() {
+        defer { ASRService.invalidateDictionaryCache() }
+        self.withRestoredDefaults(keys: [self.customDictionaryEntriesKey]) {
+            SettingsStore.shared.customDictionaryEntries = []
+            ASRService.invalidateDictionaryCache()
+            XCTAssertEqual(
+                ASRService.applyCustomDictionary("Ask claud to log it in post hoc for fluid voice."),
+                "Ask Claude to log it in PostHog for FluidVoice."
+            )
+
+            // A user mapping for the same spelling replaces the built-in one.
+            SettingsStore.shared.customDictionaryEntries = [SettingsStore.CustomDictionaryEntry(triggers: ["post hoc"], replacement: "post hoc")]
+            ASRService.invalidateDictionaryCache()
+            XCTAssertEqual(ASRService.applyCustomDictionary("an analysis done post hoc"), "an analysis done post hoc")
+            XCTAssertEqual(ASRService.applyCustomDictionary("ask claud"), "ask Claude", "Other built-ins still apply")
+        }
+    }
+}

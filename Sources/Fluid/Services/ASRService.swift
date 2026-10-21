@@ -7477,7 +7477,8 @@ final class ASRService: ObservableObject {
     /// Rebuilds the regex cache if dictionary has changed.
     /// Called lazily on first apply after settings change.
     private static func rebuildDictionaryCache() {
-        let entries = SettingsStore.shared.customDictionaryEntries
+        let userEntries = SettingsStore.shared.customDictionaryEntries
+        let entries = userEntries + BuiltInDictionary.entries(excludingSpellingsIn: userEntries)
         var patterns: [CachedDictionaryPattern] = []
 
         for entry in entries {
@@ -7554,9 +7555,7 @@ final class ASRService: ObservableObject {
     /// Uses case-insensitive matching with word boundaries.
     /// Optimized: caches compiled regexes to avoid per-call compilation overhead.
     static func applyCustomDictionary(_ text: String) -> String {
-        // Fast path: no entries configured
-        let entries = SettingsStore.shared.customDictionaryEntries
-        guard !entries.isEmpty else { return text }
+        // Built-in spellings always exist, so the compiled patterns decide whether there is work.
 
         // Rebuild cache if needed (lazy initialization)
         if self.dictionaryCacheNeedsRebuild {

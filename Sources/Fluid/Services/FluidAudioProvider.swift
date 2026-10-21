@@ -1004,7 +1004,7 @@ final class FluidAudioProvider: TranscriptionProvider {
                 profiles: profiles,
                 labels: Self.dictionaryLabels(from: self.effectiveCustomDictionaryEntries).filter { eligibleIDs.contains($0.key) },
                 temporalMatches: temporalMatches,
-                entries: self.effectiveCustomDictionaryEntries,
+                entries: self.effectiveCustomDictionaryEntries + BuiltInDictionary.entries,
                 onAccepted: { id, label, range in
                     acceptedEvidence += acousticEvidence.filter { $0.entryID == id && $0.label == label && $0.sourceWordRange == range }
                 },
@@ -1253,7 +1253,7 @@ final class FluidAudioProvider: TranscriptionProvider {
                 profiles: references.map(\.profile),
                 labels: Self.dictionaryLabels(from: self.effectiveCustomDictionaryEntries),
                 temporalMatches: temporalMatches,
-                entries: self.effectiveCustomDictionaryEntries,
+                entries: self.effectiveCustomDictionaryEntries + BuiltInDictionary.entries,
                 onAccepted: { id, label, range in
                     acceptedEvidence += acousticEvidence.filter { $0.entryID == id && $0.label == label && $0.sourceWordRange == range }
                 },
