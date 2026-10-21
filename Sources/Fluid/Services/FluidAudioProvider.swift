@@ -1330,6 +1330,14 @@ final class FluidAudioProvider: TranscriptionProvider {
         // Words recorded in the Add Word screen: slide each recording along the whole dictation.
         // This does not depend on the averaged-window shortlist, which misses words said differently in a sentence.
         let query = DictionaryMatchFrames(hiddenSize: features.hiddenSize, values: features.values)
+        // Right after a word is saved, its recordings are still being prepared. A dictation that
+        // finishes first would be checked against nothing, so wait briefly for that one preparation.
+        let deadline = ContinuousClock.now + .seconds(2)
+        while self.temporalWarmTask != nil, ContinuousClock.now < deadline,
+              profiles.contains(where: { $0.hasTemporalRecordings && self.temporalReferenceCache[DictionaryNegativeEvidenceResolver.profileKey($0)] == nil })
+        {
+            try await Task.sleep(for: .milliseconds(40))
+        }
         var stampedProfiles = Set<String>()
         for (index, profile) in profiles.enumerated() where profile.hasTemporalRecordings {
             try Task.checkCancellation()
