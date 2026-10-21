@@ -21,6 +21,8 @@ using namespace metal;
     float glowWidth = 9.0 + 6.0 * energy;
     float3 light = float3(0.0);
     float hot = 0.0;
+    float coreSum = 0.0;
+    float glowSum = 0.0;
 
     for (int i = 0; i < 5; i++) {
         float f = float(i);
@@ -33,15 +35,30 @@ using namespace metal;
         float core = exp(-d * d / (2.0 * 1.1 * 1.1));
         float glow = exp(-d / glowWidth);
         light += tint * (core * 1.2 + glow * (0.5 + 0.15 * energy)) * weight;
+        coreSum += core * weight;
+        glowSum += glow * weight;
         if (i == 0) { hot = core; }
     }
 
     // Soft bloom behind the middle of the ribbon, stronger while speaking.
     float2 centre = float2((x - 0.5) * 2.2, y / (size.y * 0.5));
     float bloom = exp(-dot(centre, centre) * 2.2) * (0.22 + 0.12 * energy);
+
+    if (dark < 0.5) {
+        // Added light only washes out on a light background. Paint deeper, saturated ink instead:
+        // opacity comes from the strands' strength, so the colour itself can stay rich.
+        float3 teal = float3(0.0, 0.58, 0.82);
+        float3 deepBlue = float3(0.10, 0.33, 0.93);
+        float3 deepViolet = float3(0.45, 0.22, 0.90);
+        float3 ink = x < 0.5 ? mix(teal, deepBlue, x * 2.0) : mix(deepBlue, deepViolet, (x - 0.5) * 2.0);
+        float coverage = saturate(coreSum * 0.95 + glowSum * (0.22 + 0.08 * energy) + bloom * 0.35) * ends;
+        float3 shade = mix(ink, ink * 0.78, saturate(hot));
+        return half4(half3(shade * coverage), half(coverage));
+    }
+
     light += mix(blue, cyan, 0.4) * bloom;
 
-    light += float3(1.0) * hot * (dark > 0.5 ? 0.75 : 0.25) ;
+    light += float3(1.0) * hot * 0.75;
     light *= ends;
 
     float alpha = saturate(max(light.r, max(light.g, light.b)));
