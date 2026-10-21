@@ -158,6 +158,7 @@ protocol WindowSnapshotProviding: AnyObject {
 nonisolated struct BrowserTabURL: Sendable, Equatable {
     var host: String
     var path: String
+    var callState: MeetingBrowserCallState = .unknown
 }
 
 @MainActor
@@ -967,7 +968,8 @@ final class AXBrowserTabReader: BrowserTabReading {
         let windowElement = window as! AXUIElement
 
         let document = self.stringAttribute(windowElement, attribute: "AXDocument")
-        if let document, let url = self.parse(document) {
+        let documentURL = document.flatMap(self.parse)
+        if let url = documentURL, !MeetingBrowserCallEvidence.supports(url) {
             return .found(url)
         }
 
@@ -976,6 +978,7 @@ final class AXBrowserTabReader: BrowserTabReading {
         if let found = self.findWebAreaURL(root: windowElement, depth: 0, budget: &budget, timedOut: &timedOut) {
             return .found(found)
         }
+        if let documentURL { return .found(documentURL) }
         return timedOut ? .timedOut : .notFound("document=\(document == nil ? "nil" : "set") webarea=miss")
     }
 
@@ -993,7 +996,8 @@ final class AXBrowserTabReader: BrowserTabReading {
             guard budget > 0 else { return nil }
             let role = self.stringAttribute(child, attribute: kAXRoleAttribute as String) ?? ""
             if role == "AXWebArea" {
-                if let urlString = self.stringAttribute(child, attribute: "AXURL"), let url = self.parse(urlString) {
+                if let urlString = self.stringAttribute(child, attribute: "AXURL"), var url = self.parse(urlString) {
+                    url.callState = MeetingBrowserCallAXReader.state(webArea: child, url: url)
                     return url
                 }
                 continue

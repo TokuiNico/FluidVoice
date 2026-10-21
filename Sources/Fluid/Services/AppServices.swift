@@ -132,17 +132,17 @@ final class AppServices: ObservableObject {
         )
         self._meetingSessionCoordinator = coordinator
         self.setupMeetingCoordinatorForwarding()
-        // The auto-detected episode itself stays consumed until the meeting's own evidence ends
-        // (window/URL gone ≥60s) — not merely because our recording stopped — so only the nudge
-        // and the end-of-meeting watch are dropped here.
+        // Attach end monitoring to every captured call, including manual and menu-bar starts.
+        // Start-prompt episodes remain consumed until the meeting's own evidence ends.
         coordinator.$state
             .receive(on: DispatchQueue.main)
             .sink { [weak self, weak coordinator] state in
                 // Deliveries are queued, so read the state as it is now before calling a recording over.
-                switch coordinator?.state {
-                case .preparing, .recording, .recordingDegraded: break
-                default: self?._meetingAutoDetector?.recordingStopped()
-                }
+                Self.synchronizeMeetingEndWatch(
+                    state: coordinator?.state,
+                    session: coordinator?.activeSession,
+                    detector: self?._meetingAutoDetector
+                )
                 guard !MeetingOverlayVisibility.isVisible(for: state) else { return }
                 MeetingStillRecordingNudgeController.shared.hide()
             }
@@ -185,6 +185,12 @@ final class AppServices: ObservableObject {
     }
 
     private func wireMeetingAutoDetector(_ detector: MeetingAutoDetector) {
+        // The detector is lazy; a manual recording may already be running when it is created.
+        Self.synchronizeMeetingEndWatch(
+            state: self._meetingSessionCoordinator?.state,
+            session: self._meetingSessionCoordinator?.activeSession,
+            detector: detector
+        )
         detector.onAutomaticTargetChanged = { [weak self] target in
             self?.meetingAutomaticTarget = target
         }
@@ -227,6 +233,30 @@ final class AppServices: ObservableObject {
         MeetingStillRecordingNudgeController.shared.onStop = { [weak self] in
             guard let self else { return }
             Task { @MainActor in _ = try? await self.meetingSessionCoordinator.stopAndTranscribe() }
+        }
+    }
+
+    /// Inputs must be the coordinator's current snapshot, not a queued state notification.
+    static func synchronizeMeetingEndWatch(
+        state: MeetingCoordinatorState?,
+        session: MeetingSession?,
+        detector: MeetingAutoDetector?
+    ) {
+        guard let detector else { return }
+        switch state {
+        case .preparing:
+            break
+        case let .recording(id), let .recordingDegraded(id):
+            guard let session, session.id == id else {
+                detector.recordingStopped()
+                return
+            }
+            detector.recordingStarted(
+                sessionID: id,
+                application: session.mode == .onlineCall ? session.capturedApplication : nil
+            )
+        default:
+            detector.recordingStopped()
         }
     }
 
