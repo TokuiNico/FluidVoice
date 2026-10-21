@@ -4342,3 +4342,60 @@ extension DictationE2ETests {
         XCTAssertEqual(DictionaryPronunciationExperiment.spokenFrames(loud + quiet + quiet, frames: 0..<3), [0, 1, 2])
     }
 }
+
+extension DictationE2ETests {
+    func testTextClaimedCoversSavedSpellingsAndCorrectWords() {
+        let entry = SettingsStore.CustomDictionaryEntry(triggers: ["sneak them"], replacement: "Snigdham")
+        let words = ["What", "is", "sneak", "them?", "Snigdham", "said"]
+        XCTAssertEqual(DictionaryAudioSpan.textClaimed(words: words, entries: [entry]), [2, 3, 4])
+        XCTAssertTrue(DictionaryAudioSpan.textClaimed(words: words, entries: []).isEmpty)
+    }
+
+    func testAudioSpanReplacesWholeMishearingButNotNeighbours() {
+        let targets = ["Snigdham", "snick them"]
+        // The match touched only "them"; the run grows to the whole mishearing.
+        XCTAssertEqual(DictionaryAudioSpan.span(words: ["What", "do", "you", "mean", "by", "sneak", "them"], touched: [6], claimed: [], targets: targets), 5...6)
+        // The match spilled onto "is"; the run drops it and takes "Snick" instead.
+        XCTAssertEqual(DictionaryAudioSpan.span(words: ["Snick", "them", "is", "a", "weird", "name"], touched: [1, 2], claimed: [], targets: targets), 0...1)
+        // A new single-word spelling stays a single word.
+        XCTAssertEqual(DictionaryAudioSpan.span(words: ["Who", "the", "fuck", "is", "Nickdom?"], touched: [4], claimed: [], targets: targets), 4...4)
+    }
+
+    func testAudioSpanNeverTouchesWordsTheTextLayerOwns() {
+        let words = ["Snick", "them", "met", "Snick", "them"]
+        XCTAssertNil(DictionaryAudioSpan.span(words: words, touched: [3, 4], claimed: [3, 4], targets: ["Snigdham"]))
+        // The same word said twice: the text layer owns one, the audio match may still take the other.
+        XCTAssertEqual(DictionaryAudioSpan.span(words: words, touched: [0, 1], claimed: [3, 4], targets: ["Snigdham"]), 0...1)
+        XCTAssertNil(DictionaryAudioSpan.span(words: words, touched: [], claimed: [], targets: ["Snigdham"]))
+    }
+
+    #if arch(arm64)
+    func testRecordedWordMatchLeavesSavedSpellingsToTheTextLayer() {
+        let id = UUID()
+        let profile = PronunciationDictionaryProfile(dictionaryEntryID: id, label: "Snigdham", modelKey: "v3", hiddenSize: 1, enrollments: [])
+        let result = ASRResult(text: "what do you mean by sneak them", confidence: 1, duration: 3, processingTime: 0, tokenTimings: [
+            TokenTiming(token: "▁what", tokenId: 1, startTime: 0.16, endTime: 0.40, confidence: 1),
+            TokenTiming(token: "▁do", tokenId: 2, startTime: 0.40, endTime: 0.56, confidence: 1),
+            TokenTiming(token: "▁you", tokenId: 3, startTime: 0.56, endTime: 0.64, confidence: 1),
+            TokenTiming(token: "▁mean", tokenId: 4, startTime: 0.64, endTime: 0.80, confidence: 1),
+            TokenTiming(token: "▁by", tokenId: 5, startTime: 0.80, endTime: 0.96, confidence: 1),
+            TokenTiming(token: "▁sneak", tokenId: 6, startTime: 0.96, endTime: 1.44, confidence: 1),
+            TokenTiming(token: "▁them", tokenId: 7, startTime: 1.44, endTime: 1.60, confidence: 1),
+        ])
+        // The stamp match covers only the end of the word, as recorded in the app (frames 15-20).
+        let hit = PronunciationWindowMatch(prototypeIndex: 0, score: 0.94, frameRange: 15..<20)
+        let temporal: Set<FluidAudioProvider.TemporalMatchKey> = [.init(prototypeIndex: 0, frameRange: 15..<20)]
+        let unknownSpelling = SettingsStore.CustomDictionaryEntry(id: id, triggers: ["snick them"], replacement: "Snigdham")
+        XCTAssertEqual(
+            FluidAudioProvider.applyPronunciationMatches(result: result, matches: [hit], profiles: [profile], labels: [id: "Snigdham"], temporalMatches: temporal, entries: [unknownSpelling]),
+            "what do you mean by Snigdham"
+        )
+        // A saved spelling already covers it: the audio layer leaves the text for the text layer.
+        let knownSpelling = SettingsStore.CustomDictionaryEntry(id: id, triggers: ["sneak them"], replacement: "Snigdham")
+        XCTAssertEqual(
+            FluidAudioProvider.applyPronunciationMatches(result: result, matches: [hit], profiles: [profile], labels: [id: "Snigdham"], temporalMatches: temporal, entries: [knownSpelling]),
+            result.text
+        )
+    }
+    #endif
+}

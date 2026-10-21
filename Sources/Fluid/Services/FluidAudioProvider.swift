@@ -995,6 +995,7 @@ final class FluidAudioProvider: TranscriptionProvider {
                 profiles: profiles,
                 labels: Self.dictionaryLabels(from: self.effectiveCustomDictionaryEntries).filter { eligibleIDs.contains($0.key) },
                 temporalMatches: temporalMatches,
+                entries: self.effectiveCustomDictionaryEntries,
                 onAccepted: { id, label, range in
                     acceptedEvidence += acousticEvidence.filter { $0.entryID == id && $0.label == label && $0.sourceWordRange == range }
                 }
@@ -1240,6 +1241,7 @@ final class FluidAudioProvider: TranscriptionProvider {
                 profiles: references.map(\.profile),
                 labels: Self.dictionaryLabels(from: self.effectiveCustomDictionaryEntries),
                 temporalMatches: temporalMatches,
+                entries: self.effectiveCustomDictionaryEntries,
                 onAccepted: { id, label, range in
                     acceptedEvidence += acousticEvidence.filter { $0.entryID == id && $0.label == label && $0.sourceWordRange == range }
                 }
@@ -1555,6 +1557,7 @@ final class FluidAudioProvider: TranscriptionProvider {
         profiles: [PronunciationDictionaryProfile],
         labels: [UUID: String],
         temporalMatches: Set<TemporalMatchKey> = [],
+        entries: [SettingsStore.CustomDictionaryEntry] = [],
         onAccepted: ((UUID, String, Range<Int>) -> Void)? = nil
     ) -> String {
         guard let timings = result.tokenTimings else { return result.text }
@@ -1562,6 +1565,8 @@ final class FluidAudioProvider: TranscriptionProvider {
         guard !words.isEmpty else { return result.text }
 
         let wordIndex = WordAudioOverlapIndex(words: words)
+        // The text layer runs after this and owns every word a saved spelling already covers.
+        let textClaimed = DictionaryAudioSpan.textClaimed(words: words.map(\.text), entries: entries)
 
         struct Candidate {
             let entryID: UUID
@@ -1578,14 +1583,24 @@ final class FluidAudioProvider: TranscriptionProvider {
             else { continue }
             let startTime = Double(match.frameRange.lowerBound) * 0.08
             let endTime = Double(match.frameRange.upperBound) * 0.08
-            let indices = wordIndex.substantiallyOverlappingWordIndices(
-                startTime: startTime,
-                endTime: endTime
-            )
-            guard !indices.isEmpty else { continue }
             let profile = profiles[match.prototypeIndex]
-            let heard = indices.map { words[$0].text }.joined(separator: " ")
             let temporalAccepted = temporalMatches.contains(TemporalMatchKey(prototypeIndex: match.prototypeIndex, frameRange: match.frameRange))
+            let indices: [Int]
+            if temporalAccepted {
+                // Recognizer word times are rough, so start from every word the match touches and
+                // settle on the whole run of free words that looks most like this word.
+                let touched = wordIndex.substantiallyOverlappingWordIndices(startTime: startTime, endTime: endTime, minimumOverlapRatio: 0)
+                let spellings = entries.first { $0.id == profile.dictionaryEntryID }?.triggers ?? []
+                guard let run = DictionaryAudioSpan.span(
+                    words: words.map(\.text), touched: touched, claimed: textClaimed, targets: [label] + spellings
+                ) else { continue }
+                indices = Array(run)
+            } else {
+                indices = wordIndex.substantiallyOverlappingWordIndices(startTime: startTime, endTime: endTime)
+                guard indices.allSatisfy({ !textClaimed.contains($0) }) else { continue }
+            }
+            guard !indices.isEmpty else { continue }
+            let heard = indices.map { words[$0].text }.joined(separator: " ")
             guard temporalAccepted || DictionaryPronunciationDecision.accepts(score: match.score, heardText: heard, profile: profile) else { continue }
             var correctedLabel = label
             if profile.hasOriginalAudio {
