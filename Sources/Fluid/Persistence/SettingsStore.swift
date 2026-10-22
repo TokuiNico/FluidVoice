@@ -518,11 +518,11 @@ final class SettingsStore: ObservableObject {
         self.setDictationPromptSelection(selection, for: .primary)
     }
 
-    func dictationPromptSelection(for slot: DictationShortcutSlot) -> DictationPromptSelection {
+    func dictationPromptSelection(for slot: DictationShortcutSlot, privateAIAvailable: Bool? = nil) -> DictationPromptSelection {
         if self.isDictationPromptOff(for: slot) { return .off }
         if let promptID = self.selectedDictationPromptID(for: slot) {
             if promptID == PrivateAIProviderPromptFormat.promptSelectionID {
-                return PrivateAIProviderPromptFormat.isAvailable(settings: self) ? .privateAI : .default
+                return (privateAIAvailable ?? PrivateAIProviderPromptFormat.isAvailable(settings: self)) ? .privateAI : .default
             }
             return .profile(promptID)
         }
@@ -745,9 +745,9 @@ final class SettingsStore: ObservableObject {
         return self.dictationPromptProfiles.first(where: { $0.id == id && $0.mode.normalized == .dictate })
     }
 
-    func resolvedDictationPromptSelection(for slot: DictationShortcutSlot, appBundleID: String?) -> DictationPromptSelection {
+    func resolvedDictationPromptSelection(for slot: DictationShortcutSlot, appBundleID: String?, privateAIAvailable: Bool? = nil) -> DictationPromptSelection {
         if let manual = DictationAppSession.shared.choice(for: slot, appID: appBundleID) { return manual }
-        let selection = self.dictationPromptSelection(for: slot)
+        let selection = self.dictationPromptSelection(for: slot, privateAIAvailable: privateAIAvailable)
         guard selection != .off else { return .off }
         let appOnly = self.promptRoutingScope(for: .dictate) == .selectedAppsOnly
         guard appOnly || Self.dictationSelectionSupportsAppOverride(selection) else { return selection }
@@ -774,8 +774,8 @@ final class SettingsStore: ObservableObject {
         return system ? fallback.systemPrompt : fallback.promptBody
     }
 
-    func resolvedDictationPromptProfile(for slot: DictationShortcutSlot, appBundleID: String?) -> DictationPromptProfile? {
-        switch self.resolvedDictationPromptSelection(for: slot, appBundleID: appBundleID) {
+    func resolvedDictationPromptProfile(for slot: DictationShortcutSlot, appBundleID: String?, privateAIAvailable: Bool? = nil) -> DictationPromptProfile? {
+        switch self.resolvedDictationPromptSelection(for: slot, appBundleID: appBundleID, privateAIAvailable: privateAIAvailable) {
         case .off:
             return nil
         case let .profile(promptID):
@@ -790,9 +790,9 @@ final class SettingsStore: ObservableObject {
         }
     }
 
-    func isAppDictationPromptBindingActive(for slot: DictationShortcutSlot, appBundleID: String?) -> Bool {
+    func isAppDictationPromptBindingActive(for slot: DictationShortcutSlot, appBundleID: String?, privateAIAvailable: Bool? = nil) -> Bool {
         guard DictationAppSession.shared.choice(for: slot, appID: appBundleID) == nil else { return false }
-        let selection = self.dictationPromptSelection(for: slot)
+        let selection = self.dictationPromptSelection(for: slot, privateAIAvailable: privateAIAvailable)
         guard Self.dictationSelectionSupportsAppOverride(selection) else { return false }
         return self.hasAppPromptBinding(for: .dictate, appBundleID: appBundleID)
     }
@@ -813,19 +813,19 @@ final class SettingsStore: ObservableObject {
         return model.isEmpty ? "Basic" : "\(mode) · \(model)"
     }
 
-    func dictationPromptDisplayName(for slot: DictationShortcutSlot, appBundleID: String?) -> String {
-        switch self.resolvedDictationPromptSelection(for: slot, appBundleID: appBundleID) {
+    func dictationPromptDisplayName(for slot: DictationShortcutSlot, appBundleID: String?, privateAIAvailable: Bool? = nil) -> String {
+        switch self.resolvedDictationPromptSelection(for: slot, appBundleID: appBundleID, privateAIAvailable: privateAIAvailable) {
         case .off:
             return "Basic"
         case .default:
-            if let profile = self.resolvedDictationPromptProfile(for: slot, appBundleID: appBundleID) {
+            if let profile = self.resolvedDictationPromptProfile(for: slot, appBundleID: appBundleID, privateAIAvailable: privateAIAvailable) {
                 let name = profile.name.trimmingCharacters(in: .whitespacesAndNewlines)
                 return name.isEmpty ? "Untitled" : name
             }
             return "Default"
         case .privateAI:
-            if self.isAppDictationPromptBindingActive(for: slot, appBundleID: appBundleID) {
-                if let profile = self.resolvedDictationPromptProfile(for: slot, appBundleID: appBundleID) {
+            if self.isAppDictationPromptBindingActive(for: slot, appBundleID: appBundleID, privateAIAvailable: privateAIAvailable) {
+                if let profile = self.resolvedDictationPromptProfile(for: slot, appBundleID: appBundleID, privateAIAvailable: privateAIAvailable) {
                     let name = profile.name.trimmingCharacters(in: .whitespacesAndNewlines)
                     return name.isEmpty ? "Untitled" : name
                 }

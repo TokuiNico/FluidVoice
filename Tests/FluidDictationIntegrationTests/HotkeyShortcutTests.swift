@@ -2112,6 +2112,7 @@ final class HotkeyShortcutTests: XCTestCase {
             manager.updatePrimaryShortcuts([first, modifier])
             if mouse {
                 let down = try XCTUnwrap(CGEvent(mouseEventSource: nil, mouseType: .otherMouseDown, mouseCursorPosition: .zero, mouseButton: .center))
+                down.flags = []
                 _ = manager.handleMouseShortcutEvent(type: .otherMouseDown, event: down)
             } else {
                 _ = try manager.handleKeyEvent(type: .keyDown, event: self.primaryReleaseTestEvent(type: .keyDown))
@@ -2125,6 +2126,7 @@ final class HotkeyShortcutTests: XCTestCase {
             XCTAssertEqual(starts, 0, "A second modifier shortcut must not activate before the owning key/button releases")
             if mouse {
                 let up = try XCTUnwrap(CGEvent(mouseEventSource: nil, mouseType: .otherMouseUp, mouseCursorPosition: .zero, mouseButton: .center))
+                up.flags = []
                 _ = manager.handleMouseShortcutEvent(type: .otherMouseUp, event: up)
             } else {
                 _ = try manager.handleKeyEvent(type: .keyUp, event: self.primaryReleaseTestEvent(type: .keyUp, modifiers: []))

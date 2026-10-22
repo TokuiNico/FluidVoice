@@ -100,8 +100,9 @@ struct BottomWaveformView: View {
     /// Drawn at display rate so the bars move on springs instead of stepping with each level tick.
     @ViewBuilder
     private var barsView: some View {
-        // The panel stays alive while hidden; never tick the simulation unless it is on screen.
-        if !self.contentState.isBottomOverlayPresented || self.isReleaseAnimationActive || self.contentState.isProcessing {
+        // Waiting bars are static. Starting a 50 Hz Canvas before first PCM
+        // needlessly competes with the capture-start continuation on main.
+        if !self.contentState.isBottomOverlayPresented || self.isWaitingForMicrophone || self.isReleaseAnimationActive || self.contentState.isProcessing {
             self.bars(heights: Array(repeating: self.minHeight, count: self.barCount))
         } else {
             TimelineView(.animation(minimumInterval: 1.0 / 50.0)) { timeline in

@@ -2228,12 +2228,12 @@ final class ASRService: ObservableObject {
         return AudioCapturePipeline(
             audioBuffer: self.audioBuffer,
             onFirstAudio: { sessionID, attemptID, sampleCount, frameLength, sampleRate, acquisitionMs, elapsedMs in
-                Task {
-                    readinessGate.signalFirstPCM(
-                        sessionID: sessionID,
-                        attemptID: attemptID
-                    )
-                }
+                // This gate is lock-protected. Signal from the capture worker;
+                // a Task created here inherits MainActor and can wait behind UI work.
+                readinessGate.signalFirstPCM(
+                    sessionID: sessionID,
+                    attemptID: attemptID
+                )
                 DispatchQueue.main.async {
                     let bufferMs = Int((Double(frameLength) / sampleRate * 1000).rounded())
                     DebugLogger.shared.benchmark(

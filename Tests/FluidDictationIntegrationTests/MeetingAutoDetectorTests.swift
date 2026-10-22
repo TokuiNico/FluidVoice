@@ -427,6 +427,54 @@ final class MeetingAutoDetectorTests: XCTestCase {
         XCTAssertEqual(h.prompts.first?.tier, .browserTier2)
     }
 
+    func testProcessOwnerLookupDoesNotBlockMainAndPreservesSnapshot() async {
+        let entered = expectation(description: "owner lookup on worker")
+        let release = DispatchSemaphore(value: 0)
+        let owners = [MeetingProcessOwner(processID: 42, bundleIdentifier: "us.zoom.xos", bundlePath: "/Applications/zoom.us.app")]
+        let provider = CoreAudioProcessActivityProvider(
+            readOwners: {
+                XCTAssertFalse(Thread.isMainThread)
+                entered.fulfill()
+                XCTAssertEqual(release.wait(timeout: .now() + 2), .success)
+                return owners
+            },
+            readActivity: { snapshotOwners in
+                XCTAssertFalse(Thread.isMainThread)
+                return .init(processes: [], owners: snapshotOwners, queryState: .valid)
+            }
+        )
+        let task = Task { await provider.snapshot() }
+        await fulfillment(of: [entered], timeout: 1)
+        // This main-actor continuation must run while the owner lookup is blocked.
+        release.signal()
+        let snapshot = await task.value
+        XCTAssertEqual(snapshot.owners, owners)
+        XCTAssertEqual(snapshot.queryState, .valid)
+    }
+
+    func testCancelledProcessOwnerLookupSkipsAudioQuery() async {
+        let entered = expectation(description: "owner lookup on worker")
+        let release = DispatchSemaphore(value: 0)
+        let provider = CoreAudioProcessActivityProvider(
+            readOwners: {
+                entered.fulfill()
+                _ = release.wait(timeout: .now() + 2)
+                return []
+            },
+            readActivity: { _ in
+                XCTFail("A cancelled meeting poll must not start an audio query")
+                return .init(processes: [], owners: [], queryState: .valid)
+            }
+        )
+        let task = Task { await provider.snapshot() }
+        await fulfillment(of: [entered], timeout: 1)
+        task.cancel()
+        release.signal()
+        let snapshot = await task.value
+        XCTAssertEqual(snapshot.queryState, .unknown)
+        XCTAssertTrue(snapshot.owners.isEmpty)
+    }
+
     func testLiveAudioProcessOwnershipProbe() async throws {
         guard ProcessInfo.processInfo.environment["FV_DETECTOR_LIVE_PROBE"] == "1" else {
             throw XCTSkip("Opt-in read-only live Core Audio ownership probe")
