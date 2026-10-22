@@ -63,6 +63,11 @@ final class DeliveryFailureOverlayController {
                 guard let self, self.hostingView?.rootView.generation == currentGeneration else { return }
                 self.hide(after: 0.9)
             },
+            onCopyFailed: { [weak self] in
+                guard let self, self.panel?.isVisible == true,
+                      self.hostingView?.rootView.generation == currentGeneration else { return }
+                self.show(kind: kind, transcript: transcript)
+            },
             onDismiss: { [weak self] in
                 guard let self, self.hostingView?.rootView.generation == currentGeneration else { return }
                 self.hide()
@@ -181,6 +186,7 @@ private struct DeliveryFailureOverlayView: View {
     let displayDuration: TimeInterval
     let startedAt: Date
     let onCopied: () -> Void
+    let onCopyFailed: () -> Void
     let onDismiss: () -> Void
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -292,6 +298,7 @@ private struct DeliveryFailureOverlayView: View {
     private func copy() {
         guard ClipboardService.copyToClipboard(self.transcript) else {
             self.didCopy = false
+            self.onCopyFailed()
             return
         }
         withAnimation(.easeOut(duration: 0.15)) { self.didCopy = true }

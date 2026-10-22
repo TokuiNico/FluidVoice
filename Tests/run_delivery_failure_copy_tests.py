@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Exercise production recovery actions with a deterministic clipboard stand-in.
 
-This executes the actual Swift method bodies, including their real delayed work.
+This executes the actual Swift action and controller methods with their delayed work.
+Panel and clipboard stand-ins keep the checks independent of the desktop.
 It does not verify SwiftUI identity; the signed UI fixture covers presentation reuse.
-Use --revision HEAD to run against the pre-fix committed actions.
+Use --revision <commit> to check an earlier version of the production methods.
 """
 from pathlib import Path
 import argparse
@@ -33,6 +34,8 @@ card = read_source("DeliveryFailureCard")
 card_actions = card[card.index("    private func copy() {"):card.rfind("\n}")]
 overlay = read_source("DeliveryFailureOverlay")
 overlay_action = overlay[overlay.index("    private func copy() {"):overlay.rfind("\n}")]
+controller_actions = overlay[overlay.index("    func show(kind:"):overlay.index("    private func createPanel(")]
+controller_duration = overlay[overlay.index("    private static let displayDuration:"):overlay.index("    private var panel:")]
 swift = r'''
 import Foundation
 import SwiftUI
@@ -62,8 +65,69 @@ final class Popup {
     var transcript = "first transcript"
     var didCopy = false
     var successes = 0
-    var onCopied: () -> Void { { self.successes += 1 } }
+    var failures = 0
+    var kind = DeliveryFailureOverlayController.Kind.deliveryFailed
+    var displayDuration: TimeInterval = 10
+    var startedAt = Date()
+    var onCopied: () -> Void = {}
+    var onCopyFailed: () -> Void = {}
+    var onDismiss: () -> Void = {}
+    init(
+        kind: DeliveryFailureOverlayController.Kind = .deliveryFailed,
+        transcript: String = "first transcript",
+        displayDuration: TimeInterval = 10,
+        startedAt: Date = Date(),
+        onCopied: (() -> Void)? = nil,
+        onCopyFailed: (() -> Void)? = nil,
+        onDismiss: @escaping () -> Void = {}
+    ) {
+        self.kind = kind
+        self.transcript = transcript
+        self.displayDuration = displayDuration
+        self.startedAt = startedAt
+        self.onCopied = onCopied ?? { [weak self] in self?.successes += 1 }
+        self.onCopyFailed = onCopyFailed ?? { [weak self] in self?.failures += 1 }
+        self.onDismiss = onDismiss
+    }
     OVERLAY_ACTION
+}
+typealias DeliveryFailureOverlayView = Popup
+struct DeliveryFailureOverlayRoot {
+    let generation: UInt64
+    let content: Popup
+}
+final class HostingView {
+    var rootView: DeliveryFailureOverlayRoot
+    init(rootView: DeliveryFailureOverlayRoot) { self.rootView = rootView }
+}
+final class Panel {
+    var isVisible = false
+    var alphaValue = 1.0
+    func orderFrontRegardless() { self.isVisible = true }
+    func orderOut(_ sender: Any?) { self.isVisible = false }
+    func animator() -> Panel { self }
+}
+struct DebugLogger {
+    static let shared = DebugLogger()
+    func info(_ message: String, source: String) {}
+}
+final class DeliveryFailureOverlayController {
+    enum Kind { case deliveryFailed }
+    CONTROLLER_DURATION
+    var panel: Panel?
+    var hostingView: HostingView?
+    var dismissTask: Task<Void, Never>?
+    var generation: UInt64 = 0
+    CONTROLLER_ACTIONS
+    private func createPanel(rootView: DeliveryFailureOverlayRoot) {
+        self.panel = Panel()
+        self.hostingView = HostingView(rootView: rootView)
+    }
+    private func resizeAndPositionPanel() {}
+    private func animate(duration: TimeInterval, changes: () -> Void, completion: (() -> Void)? = nil) {
+        changes()
+        completion?()
+    }
 }
 @main struct Tests {
     static var failures = 0
@@ -142,10 +206,55 @@ final class Popup {
         failedPopup.copy()
         check(!failedPopup.didCopy && failedPopup.successes == 0, "Fresh failed popup must not say Copied or dismiss")
         check(ClipboardService.text == "clipboard before test", "Failed popup copy must preserve clipboard")
+
+        // Run the real show/hide methods: a failed re-copy must cancel the earlier short hide.
+        ClipboardService.reset()
+        let controller = DeliveryFailureOverlayController()
+        controller.show(kind: .deliveryFailed, transcript: "retry transcript")
+        let firstPresentation = controller.hostingView!.rootView
+        firstPresentation.content.copy()
+        check(firstPresentation.content.didCopy, "Controller initially reports a successful copy")
+        ClipboardService.fail = true
+        firstPresentation.content.copy()
+        let retryPresentation = controller.hostingView!.rootView
+        check(retryPresentation.generation != firstPresentation.generation, "Failed re-copy replaces the pending short hide")
+        check(retryPresentation.content.startedAt > firstPresentation.content.startedAt &&
+              retryPresentation.content.displayDuration == 10, "Failed copy restores the full ten-second countdown")
+        check(retryPresentation.content.transcript == "retry transcript" && !retryPresentation.content.didCopy,
+              "Retry keeps the current transcript and clears Copied")
+        let retryGeneration = controller.generation
+        firstPresentation.content.onCopied()
+        firstPresentation.content.onCopyFailed()
+        firstPresentation.content.onDismiss()
+        check(controller.generation == retryGeneration, "Stale copy, failure and dismiss callbacks leave the retry alone")
         try await Task.sleep(nanoseconds: 1_300_000_000)
+        check(controller.panel?.isVisible == true, "Failed re-copy stays visible beyond the old success hide")
         check(disappearingCard.dismissals == 0, "Cancelled copy timer never dismisses after disappearance")
         check(changingCard.dismissals == 0, "Old copy timer never dismisses a replacement transcript")
         changingCard.cancelAutoDismiss()
+        ClipboardService.fail = false
+        retryPresentation.content.copy()
+        check(retryPresentation.content.didCopy && ClipboardService.text == "retry transcript", "Retried controller copy succeeds")
+        try await Task.sleep(nanoseconds: 1_100_000_000)
+        check(controller.panel?.isVisible == false, "Successful retry still closes the popup")
+        let hiddenGeneration = controller.generation
+        retryPresentation.content.onCopyFailed()
+        check(controller.panel?.isVisible == false && controller.generation == hiddenGeneration,
+              "Failure callback cannot reopen an already hidden popup")
+
+        // Failure also resets a nearly expired normal timer, but the retry still has a bounded end.
+        controller.show(kind: .deliveryFailed, transcript: "expiry transcript")
+        let expiringPresentation = controller.hostingView!.rootView
+        try await Task.sleep(nanoseconds: 8_900_000_000)
+        ClipboardService.fail = true
+        expiringPresentation.content.copy()
+        try await Task.sleep(nanoseconds: 2_100_000_000)
+        check(controller.panel?.isVisible == true, "Failure near normal expiry gives a fresh retry window")
+        try await Task.sleep(nanoseconds: 8_100_000_000)
+        for _ in 0..<20 where controller.panel?.isVisible == true {
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        check(controller.panel?.isVisible == false, "An unused retry window still expires after ten seconds")
         print("\(assertions) assertions, \(failures) failures")
         if failures != 0 { exit(1) }
     }
@@ -153,6 +262,8 @@ final class Popup {
 '''
 swift = swift.replace("CARD_ACTIONS", card_actions.replace("private func ", "func "))
 swift = swift.replace("OVERLAY_ACTION", overlay_action.replace("private func ", "func "))
+swift = swift.replace("CONTROLLER_ACTIONS", controller_actions)
+swift = swift.replace("CONTROLLER_DURATION", controller_duration)
 with tempfile.TemporaryDirectory(prefix="fv-recovery-copy-") as directory:
     root = Path(directory)
     source = root / "Tests.swift"
