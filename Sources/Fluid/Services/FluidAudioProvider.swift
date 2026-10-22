@@ -257,6 +257,7 @@ final class FluidAudioProvider: TranscriptionProvider {
     private var incrementalAcceptedSampleCount = 0
     private var recordingGeneration = UUID()
     private var incrementalPronunciationProfiles: [PronunciationDictionaryProfile] = []
+    private var hasEligibleExplicitPronunciationProfiles = false
     private var automaticPronunciationProfiles: [PronunciationDictionaryProfile] = []
     private var didLoadAutomaticPronunciationProfiles = false
 
@@ -357,19 +358,22 @@ final class FluidAudioProvider: TranscriptionProvider {
     }
 
     private var effectivePronunciationMatchingEnabled: Bool {
-        DictionaryMatcherExperiment.sharedFeaturesEnabled && (self.explicitPronunciationMatchingEnabled
+        DictionaryMatcherExperiment.sharedFeaturesEnabled && ((self.explicitPronunciationMatchingEnabled && self.hasEligibleExplicitPronunciationProfiles)
             || (self.automaticPronunciationMatchingEnabled && !self.automaticPronunciationProfiles.isEmpty))
     }
 
     /// Read the actor-owned store once after capture begins, never on the microphone startup path.
     private func refreshAutomaticPronunciationProfiles(warmReferences: Bool = true) async throws {
         guard DictionaryMatcherExperiment.sharedFeaturesEnabled else {
+            self.hasEligibleExplicitPronunciationProfiles = false
             self.automaticPronunciationProfiles = []
+            self.didLoadAutomaticPronunciationProfiles = false
             return
         }
         guard !self.didLoadAutomaticPronunciationProfiles else { return }
         let generation = self.recordingGeneration
         guard self.meetingOptions == nil, self.enhancementOptions == nil || self.explicitPronunciationMatchingEnabled, !self.effectiveCustomDictionaryEntries.isEmpty else {
+            self.hasEligibleExplicitPronunciationProfiles = false
             self.automaticPronunciationProfiles = []
             self.didLoadAutomaticPronunciationProfiles = true
             return
@@ -384,6 +388,8 @@ final class FluidAudioProvider: TranscriptionProvider {
         )
         self.didLoadAutomaticPronunciationProfiles = true
         let activeProfiles = Self.matchingProfiles(stored, entries: self.effectiveCustomDictionaryEntries, includeManual: self.explicitPronunciationMatchingEnabled)
+        // The switch allows matching; only eligible saved words should change dictation routing.
+        self.hasEligibleExplicitPronunciationProfiles = self.explicitPronunciationMatchingEnabled && !activeProfiles.isEmpty
         let activeKeys = Set(activeProfiles.map(DictionaryNegativeEvidenceResolver.profileKey))
         self.temporalReferenceCache.retain(keys: activeKeys)
         let inspectionIDs = Set(activeProfiles.flatMap(\.enrollments).compactMap(\.inspectionID))
@@ -417,6 +423,12 @@ final class FluidAudioProvider: TranscriptionProvider {
     #if DEBUG
     func setWordBoostingActiveForTesting(_ active: Bool) {
         self.isWordBoostingActive = active
+    }
+
+    func refreshPronunciationRoutingForTesting(modelKey: String) async throws -> Bool {
+        self.pronunciationModelKey = modelKey
+        try await self.refreshAutomaticPronunciationProfiles(warmReferences: false)
+        return self.usesIncrementalDictation
     }
 
     /// Read-only snapshot of the actual effective enhancement getters for baseline tests.
@@ -632,6 +644,7 @@ final class FluidAudioProvider: TranscriptionProvider {
         self.latestStreamingPreviewSampleCount = 0
         self.latestStreamingPreviewFinishedAt = nil
         self.recordingGeneration = UUID()
+        self.hasEligibleExplicitPronunciationProfiles = false
         self.automaticPronunciationProfiles = []
         self.didLoadAutomaticPronunciationProfiles = false
         self.resetIncrementalSession()
@@ -654,6 +667,7 @@ final class FluidAudioProvider: TranscriptionProvider {
         self.latestStreamingPreviewSampleCount = 0
         self.latestStreamingPreviewFinishedAt = nil
         self.recordingGeneration = UUID()
+        self.hasEligibleExplicitPronunciationProfiles = false
         self.automaticPronunciationProfiles = []
         self.didLoadAutomaticPronunciationProfiles = false
         self.resetIncrementalSession()
@@ -1207,13 +1221,14 @@ final class FluidAudioProvider: TranscriptionProvider {
     private func transcribeFinalResult(
         _ samples: [Float], manager: AsrManager
     ) async throws -> (result: ASRTranscriptionResult, tokenTimings: [TokenTiming]?, textMayBeCorrected: Bool) { // swiftlint:disable:this discouraged_optional_collection
-        if self.effectivePronunciationMatchingEnabled, samples.count > Self.incrementalChunkingThresholdSamples {
+        let generation = self.recordingGeneration
+        let profiles = self.effectivePronunciationMatchingEnabled ? Self.preparedEdgeProfiles(await self.pronunciationProfiles(), cache: self.edgeReferenceCache) : []
+        try self.requireCurrentRecording(generation)
+        if !profiles.isEmpty, samples.count > Self.incrementalChunkingThresholdSamples {
             self.resetIncrementalSession()
             try await self.startIncrementalSession(manager: manager)
             return try (await self.transcribeIncrementalFinal(samples), nil, true)
         }
-        let matchingEnabled = self.effectivePronunciationMatchingEnabled && samples.count <= 16_000 * 15
-        let profiles = matchingEnabled ? Self.preparedEdgeProfiles(await self.pronunciationProfiles(), cache: self.edgeReferenceCache) : []
         // Rewritten text leaves timings on the old tokens; realigning would revert corrections.
         let textMayBeCorrected = self.isWordBoostingActive || !profiles.isEmpty
         await manager.setPronunciationCustomizationEnabled(!profiles.isEmpty)

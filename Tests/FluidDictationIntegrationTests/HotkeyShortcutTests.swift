@@ -1397,6 +1397,26 @@ final class HotkeyShortcutTests: XCTestCase {
     }
 
     @MainActor
+    func testReaddingReusedCommandOrPasteKeysRejectsTheActiveOwner() {
+        self.withIsolatedShortcutConflicts { settings in
+            let shortcut = HotkeyShortcut(keyCode: 40, modifierFlags: [.control, .command])
+            settings.commandModeHotkeyShortcut = shortcut
+            settings.pasteLastTranscriptionHotkeyShortcut = shortcut
+            for commandEnabled in [false, true] {
+                settings.commandModeShortcutEnabled = commandEnabled
+                settings.pasteLastTranscriptionShortcutEnabled = !commandEnabled
+                let target: ShortcutRecordingTarget = commandEnabled ? .pasteLast : .command
+                let owner = commandEnabled ? "Command Mode" : "Paste Last Transcription"
+                XCTAssertEqual(ContentView().shortcutConflictMessage(for: shortcut, target: target), "Duplicate with \(owner)")
+                XCTAssertEqual(settings.commandModeShortcutEnabled, commandEnabled)
+                XCTAssertEqual(settings.pasteLastTranscriptionShortcutEnabled, !commandEnabled)
+                XCTAssertEqual(settings.commandModeHotkeyShortcut, shortcut)
+                XCTAssertEqual(settings.pasteLastTranscriptionHotkeyShortcut, shortcut)
+            }
+        }
+    }
+
+    @MainActor
     private func withIsolatedShortcutConflicts(run: (SettingsStore) -> Void) {
         let keys = [
             self.primaryDictationShortcutsKey, self.legacyHotkeyShortcutKey,
