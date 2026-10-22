@@ -53,7 +53,7 @@ struct CustomDictionaryView: View {
     @State private var trainingSaveID: UUID?
     @State private var trainingVariants: [String] = []
     @State private var manualTrainingSpellings = Set<String>()
-    @AppStorage("DictionarySharedFeatureMatcherEnabled") private var pronunciationEnabled = false
+    @AppStorage("DictionarySharedFeatureMatcherEnabled") private var pronunciationEnabled = DictionaryMatcherExperiment.defaultEnabled
     @State private var pronunciationMatchingEnabled = SettingsStore.shared.pronunciationMatchingEnabled
     @State private var trainingPronunciationEnrollments: [PronunciationEnrollmentCapture] = []
     @State private var trainingSampleCount = 0
@@ -560,7 +560,7 @@ struct CustomDictionaryView: View {
                     }
                 }
             }
-            Text("\(self.entries.count) saved words")
+            Text(self.wordSearch.isEmpty ? "\(self.entries.count) saved words" : "\(self.drawerEntries.count) of \(self.entries.count) words")
                 .font(self.theme.typography.caption)
                 .foregroundStyle(self.theme.palette.secondaryText)
         }
@@ -651,13 +651,7 @@ struct CustomDictionaryView: View {
                         Task { await self.startAutomaticTrainingIfIdle() }
                     },
                     onSave: {
-                        if self.trainingAlreadyCorrectWithoutReplacement {
-                            self.wizardSavedWord = self.normalizedTrainingReplacement
-                            self.resetTraining()
-                            self.wizardStep = .saved
-                        } else {
-                            Task { await self.addTrainedReplacement() }
-                        }
+                        Task { await self.addTrainedReplacement() }
                     },
                     onBack: { self.wizardStep = .spelling },
                     onNewWord: self.startNewDictionaryWord,
@@ -808,13 +802,13 @@ struct CustomDictionaryView: View {
         VStack(alignment: .leading, spacing: self.theme.metrics.spacing.md) {
             ViewThatFits(in: .horizontal) {
                 HStack(alignment: .top, spacing: self.theme.metrics.spacing.md) {
-                    self.manualReplacementField
                     self.manualTriggerField
+                    self.manualReplacementField
                 }
 
                 VStack(alignment: .leading, spacing: self.theme.metrics.spacing.md) {
-                    self.manualReplacementField
                     self.manualTriggerField
+                    self.manualReplacementField
                 }
             }
 
@@ -855,12 +849,12 @@ struct CustomDictionaryView: View {
 
     private var manualTriggerField: some View {
         VStack(alignment: .leading, spacing: self.theme.metrics.spacing.sm) {
-            Text("What FluidVoice types wrong")
+            Text("Replace")
                 .font(self.theme.typography.captionStrong)
 
             TextField("fluid voice, fluid boys", text: self.$manualTriggerDraft)
                 .dictionaryInputChrome()
-                .accessibilityLabel("Misheard words")
+                .accessibilityLabel("Text to replace")
                 .onSubmit { self.addManualReplacementIfValid() }
 
             Text("Separate different versions with commas. Enter only commas to replace comma punctuation.")
@@ -871,12 +865,12 @@ struct CustomDictionaryView: View {
 
     private var manualReplacementField: some View {
         VStack(alignment: .leading, spacing: self.theme.metrics.spacing.sm) {
-            Text("Correct word")
+            Text("With")
                 .font(self.theme.typography.captionStrong)
             TextField("FluidVoice", text: self.$manualReplacement)
                 .dictionaryInputChrome()
                 .focused(self.$manualReplacementFocused)
-                .accessibilityLabel("Correct word")
+                .accessibilityLabel("Correct spelling")
                 .onSubmit { self.addManualReplacementIfValid() }
                 .task(id: self.manualEntryFocusRequest) {
                     await Task.yield()
@@ -2518,7 +2512,13 @@ struct CustomDictionaryView: View {
     }
 
     private func addTrainedReplacement() async {
-        guard self.canAddTrainedReplacement else { return }
+        guard !Task.isCancelled, !self.isTrainingRecording, !self.isTrainingProcessing,
+              self.canAddTrainedReplacement || self.trainingAlreadyCorrectWithoutReplacement else { return }
+        if self.trainingAlreadyCorrectWithoutReplacement {
+            self.trainingHasError = true
+            self.trainingStatusMessage = "FluidVoice already recognises this word. Nothing new was saved."
+            return
+        }
         self.isTrainingProcessing = true
         let saveID = UUID()
         self.trainingSaveID = saveID
@@ -2551,6 +2551,11 @@ struct CustomDictionaryView: View {
             triggers: filtered.accepted,
             savePronunciation: savePronunciation
         )
+        guard savePronunciation || updatedEntries != originalEntries else {
+            self.trainingHasError = true
+            self.trainingStatusMessage = "These spellings are already covered. Nothing new was saved."
+            return
+        }
         let entry = updatedEntries.first {
             $0.replacement.caseInsensitiveCompare(replacementText) == .orderedSame
         }

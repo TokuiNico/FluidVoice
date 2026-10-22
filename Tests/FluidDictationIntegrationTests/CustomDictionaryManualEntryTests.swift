@@ -9,7 +9,7 @@ import FluidAudio
 
 @MainActor
 final class CustomDictionaryManualEntryTests: XCTestCase {
-    // Pronunciation features are opt-in in the app; these tests exercise the enabled paths.
+    // Keep these tests independent of a saved pronunciation preference.
     private var priorSharedFeaturesFlag: Any?
 
     override func setUp() {
@@ -21,6 +21,51 @@ final class CustomDictionaryManualEntryTests: XCTestCase {
     override func tearDown() {
         UserDefaults.standard.set(self.priorSharedFeaturesFlag, forKey: "DictionarySharedFeatureMatcherEnabled")
         super.tearDown()
+    }
+
+    func testPronunciationDefaultsOnWithoutEnablingDiagnosticsAndPreservesOff() {
+        let defaults = UserDefaults.standard
+        let keys = [
+            "DictionarySharedFeatureMatcherEnabled", "DictionaryPronunciationGeneration",
+            "DictionaryPronunciationDebugCapture", "DictionaryNegativeLearningEnabled", "DictionaryNegativeComparisonEnabled",
+        ]
+        let savedPreferences = keys.map { defaults.object(forKey: $0) }
+        defer {
+            for (key, value) in zip(keys, savedPreferences) {
+                defaults.set(value, forKey: key)
+            }
+        }
+        for key in keys {
+            defaults.removeObject(forKey: key)
+        }
+
+        XCTAssertTrue(DictionaryMatcherExperiment.sharedFeaturesEnabled)
+        XCTAssertTrue(DictionaryMatcherExperiment.positiveEnabled)
+        XCTAssertTrue(DictionaryMatcherExperiment.needsFrames)
+        XCTAssertFalse(DictionaryPronunciationExperiment.captureEnabled)
+        XCTAssertFalse(DictionaryMatcherExperiment.collectNegatives)
+        XCTAssertFalse(DictionaryMatcherExperiment.compareNegatives)
+
+        let defaultGeneration = DictionaryMatcherExperiment.generation
+        DictionaryMatcherExperiment.setEnabled(true)
+        XCTAssertEqual(DictionaryMatcherExperiment.generation, defaultGeneration)
+
+        DictionaryMatcherExperiment.setEnabled(false)
+        XCTAssertEqual(defaults.object(forKey: keys[0]) as? Bool, false)
+        XCTAssertFalse(DictionaryMatcherExperiment.sharedFeaturesEnabled)
+        XCTAssertFalse(DictionaryMatcherExperiment.needsFrames)
+        let disabledGeneration = DictionaryMatcherExperiment.generation
+        XCTAssertNotEqual(disabledGeneration, defaultGeneration)
+        DictionaryMatcherExperiment.setEnabled(false)
+        XCTAssertEqual(DictionaryMatcherExperiment.generation, disabledGeneration)
+
+        DictionaryMatcherExperiment.setEnabled(true)
+        XCTAssertEqual(defaults.object(forKey: keys[0]) as? Bool, true)
+        XCTAssertTrue(DictionaryMatcherExperiment.sharedFeaturesEnabled)
+        XCTAssertNotEqual(DictionaryMatcherExperiment.generation, disabledGeneration)
+        XCTAssertFalse(DictionaryPronunciationExperiment.captureEnabled)
+        XCTAssertFalse(DictionaryMatcherExperiment.collectNegatives)
+        XCTAssertFalse(DictionaryMatcherExperiment.compareNegatives)
     }
 
     func testTrainingRestartWaitsBeforeStartingAndClearsWaitingState() async {
@@ -438,6 +483,48 @@ final class CustomDictionaryManualEntryTests: XCTestCase {
         )
         XCTAssertEqual(entries.count, 1)
         XCTAssertEqual(Set(entries.first?.triggers ?? []), Set(["hello", "right now", "fluid voice"]))
+    }
+
+    func testRepeatedCorrectionKeepsTheReviewOpenWithoutReportingSuccess() {
+        let entry = SettingsStore.CustomDictionaryEntry(triggers: ["super base"], replacement: "Supabase")
+        let unrelated = SettingsStore.CustomDictionaryEntry(triggers: ["other"], replacement: "Other")
+        self.withRestoredDictionary([entry, unrelated]) {
+            let session = AutomaticDictionaryTrainingSession(
+                candidate: .init(heardText: "Super base", correctedText: "Supabase"),
+                asr: AppServices.shared.asr
+            )
+            var successes = 0
+            session.onSuccess = { successes += 1 }
+
+            session.addOnlyCorrection()
+
+            XCTAssertEqual(SettingsStore.shared.customDictionaryEntries, [entry, unrelated])
+            XCTAssertEqual(session.screen, .choice)
+            XCTAssertEqual(successes, 0)
+            XCTAssertTrue(session.hasError)
+            XCTAssertTrue(session.statusMessage.contains("No new spelling corrections were saved"))
+        }
+    }
+
+    func testANewCorrectionStillSavesAndReportsSuccess() {
+        let unrelated = SettingsStore.CustomDictionaryEntry(triggers: ["other"], replacement: "Other")
+        self.withRestoredDictionary([unrelated]) {
+            let session = AutomaticDictionaryTrainingSession(
+                candidate: .init(heardText: "Super base", correctedText: "Supabase"),
+                asr: AppServices.shared.asr
+            )
+            var successes = 0
+            session.onSuccess = { successes += 1 }
+
+            session.addOnlyCorrection()
+
+            let entries = SettingsStore.shared.customDictionaryEntries
+            XCTAssertTrue(entries.contains(unrelated))
+            XCTAssertEqual(entries.first(where: { $0.replacement == "Supabase" })?.triggers, ["super base"])
+            XCTAssertEqual(session.screen, .success)
+            XCTAssertEqual(successes, 1)
+            XCTAssertFalse(session.hasError)
+        }
     }
 
     func testKeepsWhitespaceOnlyReplacements() {

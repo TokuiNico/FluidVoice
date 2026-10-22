@@ -1,6 +1,6 @@
 import Foundation
 
-/// Local opt-in. Both switches default off in a fresh installation.
+/// Pronunciation follows the master switch; diagnostic audio capture remains opt-in.
 nonisolated enum DictionaryPronunciationExperiment {
     static var enabled: Bool { DictionaryMatcherExperiment.sharedFeaturesEnabled }
     static var captureEnabled: Bool { enabled && UserDefaults.standard.bool(forKey: "DictionaryPronunciationDebugCapture") }

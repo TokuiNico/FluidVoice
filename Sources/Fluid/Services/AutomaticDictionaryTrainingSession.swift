@@ -490,7 +490,8 @@ final class AutomaticDictionaryTrainingSession: ObservableObject {
             )
         }
         guard mergedEntries != currentEntries else {
-            self.completeSave(title: "Already in Dictionary")
+            self.hasError = true
+            self.statusMessage = "These spellings are already covered. No new spelling corrections were saved."
             return
         }
 

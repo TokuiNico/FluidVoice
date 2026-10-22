@@ -1256,7 +1256,7 @@ struct ContentView: View {
         self.pendingModifierOnly = false
     }
 
-    private func shortcutConflictMessage(for shortcut: HotkeyShortcut, target: ShortcutRecordingTarget) -> String? {
+    func shortcutConflictMessage(for shortcut: HotkeyShortcut, target: ShortcutRecordingTarget) -> String? {
         if target == .meeting, !shortcut.isMeetingRecordingShortcut {
             return "Use a keyboard key with a modifier for meeting recording"
         }
@@ -1287,11 +1287,15 @@ struct ContentView: View {
         if self.isPromptModeShortcutEnabled {
             configuredShortcuts.append((.secondaryDictation, self.promptModeHotkeyShortcut))
         }
+        if self.isCommandModeShortcutEnabled, let shortcut = self.commandModeHotkeyShortcut {
+            configuredShortcuts.append((.command, shortcut))
+        }
+        if self.isPasteLastTranscriptionShortcutEnabled, let shortcut = self.pasteLastTranscriptionHotkeyShortcut {
+            configuredShortcuts.append((.pasteLast, shortcut))
+        }
         let optionalConfiguredShortcuts: [(ShortcutRecordingTarget, HotkeyShortcut?)] = [
             (.meeting, SettingsStore.shared.meetingRecordingHotkeyShortcut),
             (.cancel, self.cancelRecordingHotkeyShortcut),
-            (.command, self.commandModeHotkeyShortcut),
-            (.pasteLast, self.pasteLastTranscriptionHotkeyShortcut),
         ]
 
         for (otherTarget, configuredShortcut) in configuredShortcuts where otherTarget != target {
