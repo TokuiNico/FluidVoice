@@ -12,6 +12,7 @@ struct OverlayCaptionTests {
         self.testCorrectionsAndReset()
         self.testHiddenBufferIsBounded()
         self.testRecoveryAfterRevisionsAndLargeChunks()
+        self.testRetainedContextCorrectionWithUnchangedPreview()
         self.testWordRevealDeadlinesAndUnicode()
         try await self.testDisplayBufferDeadlinesAndCancellation()
         self.testScrollingAndReducedMotion()
@@ -90,6 +91,26 @@ struct OverlayCaptionTests {
         precondition(buffer.text.isEmpty && buffer.sourceOffset == 0)
     }
 
+    static func testRetainedContextCorrectionWithUnchangedPreview() {
+        var buffer = OverlayCaptionBuffer()
+        let hidden = String(repeating: "Earlier hidden context. ", count: 40)
+        let visible = "The old word sits on line one.\nThe second line is unchanged.\nThe last line is unchanged."
+        let original = hidden + visible
+        let corrected = hidden + visible.replacingOccurrences(of: "old", with: "new")
+        let preview = OverlayCaptionText.tail(original, limit: 50)
+        precondition(preview == .tail(corrected, limit: 50))
+        _ = buffer.update(preview, context: .tail(original, limit: 800))
+        buffer.removeHiddenPrefix(utf16Count: hidden.utf16.count - buffer.sourceOffset)
+        let retainedOffset = buffer.sourceOffset
+        precondition(buffer.update(preview, context: .tail(corrected, limit: 800)))
+        precondition(buffer.text == visible.replacingOccurrences(of: "old", with: "new"), "A correction before an unchanged preview must update retained visible lines")
+        precondition(buffer.sourceOffset == retainedOffset && buffer.preview == preview)
+        let hiddenCorrection = corrected.replacingOccurrences(of: "Earlier", with: "Another")
+        precondition(buffer.update(preview, context: .tail(hiddenCorrection, limit: 800)))
+        precondition(buffer.text == visible.replacingOccurrences(of: "old", with: "new"))
+        precondition(buffer.sourceOffset == retainedOffset && buffer.preview == preview)
+    }
+
     static func testWordRevealDeadlinesAndUnicode() {
         var reveal = OverlayCaptionReveal()
         let text = "These words arrive gradually instead of appearing together as one pasted chunk."
@@ -128,8 +149,8 @@ struct OverlayCaptionTests {
     @MainActor
     static func testDisplayBufferDeadlinesAndCancellation() async throws {
         let view = OverlayCaptionNSView(frame: CGRect(x: 0, y: 0, width: 304, height: 54))
-        func update(_ text: String, reduceMotion: Bool = false) {
-            view.update(caption: .tail(text, limit: 100), context: .tail(text, limit: 800), fontSize: 13, opacity: 1, reduceMotion: reduceMotion)
+        func update(_ text: String, reduceMotion: Bool = false, isActive: Bool = true) {
+            view.update(caption: .tail(text, limit: 100), context: .tail(text, limit: 800), fontSize: 13, opacity: 1, reduceMotion: reduceMotion, isActive: isActive)
             view.layoutSubtreeIfNeeded()
         }
         let first = "Words should flow into the preview instead of being pasted in a whole chunk."
@@ -155,6 +176,16 @@ struct OverlayCaptionTests {
         view.stopScrolling()
         try await Task.sleep(for: .milliseconds(500))
         precondition(view.accessibilityValue() as? String == beforeTeardown)
+        let hiddenText = "A retained hidden view must stop revealing words until it is presented again."
+        update(hiddenText)
+        let beforeHide = view.accessibilityValue() as? String
+        update(hiddenText, isActive: false)
+        update(hiddenText + " An update while hidden must not restart it.", isActive: false)
+        try await Task.sleep(for: .milliseconds(500))
+        precondition(view.accessibilityValue() as? String == beforeHide)
+        update(hiddenText)
+        try await Task.sleep(for: .milliseconds(500))
+        precondition(view.accessibilityValue() as? String == hiddenText)
         update("Reduce Motion presents the complete result immediately", reduceMotion: true)
         precondition(view.accessibilityValue() as? String == "Reduce Motion presents the complete result immediately")
         precondition(view.layer?.sublayers?.allSatisfy { $0.animationKeys()?.isEmpty != false } == true)

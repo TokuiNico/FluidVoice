@@ -1385,7 +1385,8 @@ struct NotchCompactBottomView: View {
                 fontSize: 9,
                 maxHeight: self.previewHeight,
                 opacity: 0.82,
-                maxLines: 1
+                maxLines: 1,
+                isActive: self.shouldShowPreview
             )
             .offset(y: self.shouldShowPreview ? 0 : -4)
             .opacity(self.shouldShowPreview ? 1 : 0)

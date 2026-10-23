@@ -6,6 +6,47 @@ import XCTest
 
 @MainActor
 final class OverlayCaptionPresentationTests: XCTestCase {
+    func testRetainedVisibleLineUpdatesWhenTheShortPreviewIsUnchanged() async throws {
+        let view = OverlayCaptionNSView(frame: CGRect(x: 0, y: 0, width: 304, height: 54))
+        let window = NSWindow(contentRect: view.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = view
+        window.orderFront(nil)
+        defer { view.stopScrolling(); window.orderOut(nil); window.contentView = nil; window.close() }
+        func drawnLines(_ text: String) async throws -> [Data] {
+            view.update(caption: .tail(text, limit: 50), context: .tail(text, limit: 800), fontSize: 13, opacity: 1, reduceMotion: true)
+            view.layoutSubtreeIfNeeded()
+            try await Task.sleep(for: .milliseconds(50))
+            let bitmap = try XCTUnwrap(NSBitmapImageRep(
+                bitmapDataPlanes: nil,
+                pixelsWide: 304,
+                pixelsHigh: 54,
+                bitsPerSample: 8,
+                samplesPerPixel: 4,
+                hasAlpha: true,
+                isPlanar: false,
+                colorSpaceName: .deviceRGB,
+                bytesPerRow: 0,
+                bitsPerPixel: 0
+            ))
+            let graphics = try XCTUnwrap(NSGraphicsContext(bitmapImageRep: bitmap))
+            try XCTUnwrap(view.layer?.presentation()).render(in: graphics.cgContext)
+            let pixels = try XCTUnwrap(bitmap.bitmapData)
+            return (0..<3).map { line in
+                Data(bytes: pixels.advanced(by: line * 18 * bitmap.bytesPerRow), count: 18 * bitmap.bytesPerRow)
+            }
+        }
+        let original = "The old word sits on line one.\nThe second line is unchanged.\nThe last line is unchanged."
+        let corrected = original.replacingOccurrences(of: "old", with: "new")
+        XCTAssertEqual(OverlayCaptionText.tail(original, limit: 50), .tail(corrected, limit: 50))
+        let before = try await drawnLines(original)
+        let after = try await drawnLines(corrected)
+        XCTAssertEqual(zip(before, after).filter { $0 != $1 }.count, 1, "Redraw the corrected visible line while preserving both unchanged lines")
+        XCTAssertEqual(view.accessibilityValue() as? String, OverlayCaptionText.tail(corrected, limit: 50).text)
+        XCTAssertEqual(view.layer?.sublayerTransform.m42, 0)
+        XCTAssertTrue(view.layer?.animationKeys()?.isEmpty ?? true)
+    }
+
     func testWordsAppearInStepsWithACompositorFade() async throws {
         let view = OverlayCaptionNSView(frame: CGRect(x: 0, y: 0, width: 304, height: 54))
         let window = NSWindow(contentRect: view.frame, styleMask: [.borderless], backing: .buffered, defer: false)
@@ -246,6 +287,52 @@ final class OverlayCaptionPresentationTests: XCTestCase {
         }
     }
 
+    func testHiddenBottomOverlayStopsPendingWordsWithoutClearingTheTranscript() async throws {
+        let settings = SettingsStore.shared
+        let state = NotchContentState.shared
+        let previousSize = settings.overlaySize
+        let previousPreview = settings.enableStreamingPreview
+        let previousText = state.transcriptionText
+        let previousProcessing = state.isProcessing
+        let controller = BottomOverlayWindowController.shared
+        defer {
+            controller.hideImmediately()
+            settings.overlaySize = previousSize
+            settings.enableStreamingPreview = previousPreview
+            state.updateTranscription(previousText)
+            state.isProcessing = previousProcessing
+        }
+        func caption(in view: NSView) -> OverlayCaptionNSView? {
+            if let caption = view as? OverlayCaptionNSView { return caption }
+            return view.subviews.lazy.compactMap { caption(in: $0) }.first
+        }
+        settings.overlaySize = .medium
+        settings.enableStreamingPreview = true
+        state.isProcessing = false
+        controller.show(audioPublisher: Just(CGFloat.zero).eraseToAnyPublisher(), mode: .dictation)
+        let text = "The hidden preview must stop revealing this long sentence while preserving the transcript for the next action."
+        state.updateTranscription(text)
+        try await Task.sleep(for: .milliseconds(35))
+        let host = try XCTUnwrap(NSApp.windows.compactMap { $0.contentView as? NSHostingView<BottomOverlayView> }.first)
+        let view = try XCTUnwrap(caption(in: host))
+        XCTAssertNotEqual(view.accessibilityValue() as? String, state.cachedPreviewText)
+        controller.hideImmediately()
+        for _ in 0..<30 where state.isBottomOverlayPresented {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertFalse(state.isBottomOverlayPresented)
+        host.layoutSubtreeIfNeeded()
+        let hiddenValue = view.accessibilityValue() as? String
+        try await Task.sleep(for: .milliseconds(500))
+        XCTAssertEqual(view.accessibilityValue() as? String, hiddenValue)
+        XCTAssertEqual(state.transcriptionText, text)
+        XCTAssertTrue(view.layer?.sublayers?.allSatisfy { $0.animationKeys()?.isEmpty != false } == true)
+        controller.show(audioPublisher: Just(CGFloat.zero).eraseToAnyPublisher(), mode: .dictation)
+        state.updateTranscription("Fresh words after reopening")
+        try await Task.sleep(for: .milliseconds(500))
+        XCTAssertEqual(try XCTUnwrap(caption(in: host)).accessibilityValue() as? String, "Fresh words after reopening")
+    }
+
     func testPreviewTracksItsPositionWithoutChangingRecordingState() {
         let state = NotchContentState.shared
         let settings = SettingsStore.shared
@@ -286,6 +373,7 @@ final class OverlayCaptionPresentationTests: XCTestCase {
         let previousProcessing = state.isProcessing
         let previousMode = state.mode
         let previousExpanded = state.isRecordingInExpandedMode
+        let previousPresented = state.isBottomOverlayPresented
         defer {
             settings.overlaySize = previousSize
             settings.enableStreamingPreview = previousPreview
@@ -294,12 +382,14 @@ final class OverlayCaptionPresentationTests: XCTestCase {
             state.isProcessing = previousProcessing
             state.mode = previousMode
             state.isRecordingInExpandedMode = previousExpanded
+            state.setBottomOverlayPresented(previousPresented)
         }
         settings.enableStreamingPreview = true
         settings.transcriptionPreviewCharLimit = 100
         state.isProcessing = false
         state.mode = .dictation
         state.isRecordingInExpandedMode = true
+        state.setBottomOverlayPresented(true)
         let review = ProcessInfo.processInfo.environment["FLUIDVOICE_CAPTION_REVIEW"] == "1"
         let window = NSWindow(contentRect: CGRect(x: 0, y: 0, width: 1000, height: 680), styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false

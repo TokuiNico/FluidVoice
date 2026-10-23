@@ -83,27 +83,34 @@ struct OverlayCaptionBuffer {
         let commonPrefix = zip(overlap, preview.text).prefix { $0 == $1 }.count
         var continuous = !overlap.isEmpty && commonPrefix >= min(12, overlap.count)
 
-        if continuous, let prefix {
-            self.text = String(previousText[prefix]) + preview.text
-        } else if !preview.text.isEmpty, let context,
-                  context.sourceOffset <= preview.sourceOffset,
-                  context.sourceOffset + context.text.utf16.count == preview.sourceOffset + preview.text.utf16.count,
-                  context.text.hasSuffix(preview.text)
+        if !preview.text.isEmpty, let context,
+           context.sourceOffset <= preview.sourceOffset,
+           context.sourceOffset + context.text.utf16.count == preview.sourceOffset + preview.text.utf16.count,
+           context.text.hasSuffix(preview.text)
         {
-            // A recognizer revision or a large chunk can replace the entire short preview.
-            // Recover the viewport from the bounded source instead of showing only its tail.
+            // Context also corrects retained visible lines before an unchanged short tail.
+            // Prefer its current words over the prefix saved from the previous update.
             let retainedStart = self.sourceOffset - context.sourceOffset
             let retainedRange = NSRange(location: max(0, retainedStart), length: max(0, context.text.utf16.count - retainedStart))
-            if retainedStart >= 0, !previousText.isEmpty,
-               let range = Range(retainedRange, in: context.text),
-               context.text[range].hasPrefix(previousText.prefix(12))
+            if continuous, retainedStart < 0,
+               let prefix = Range(NSRange(location: 0, length: -retainedStart), in: previousText)
+            {
+                // A caller may supply only the short preview. Keep visible text
+                // preceding its context, and replace everything it does cover.
+                self.text = String(previousText[prefix]) + context.text
+            } else if retainedStart >= 0, !previousText.isEmpty,
+                      let range = Range(retainedRange, in: context.text),
+                      continuous || context.text[range].hasPrefix(previousText.prefix(12))
             {
                 self.text = String(context.text[range])
                 continuous = true
             } else {
                 self.text = context.text
                 self.sourceOffset = context.sourceOffset
+                continuous = false
             }
+        } else if continuous, let prefix {
+            self.text = String(previousText[prefix]) + preview.text
         } else {
             self.text = preview.text
             self.sourceOffset = preview.sourceOffset
@@ -194,13 +201,14 @@ struct OverlayCaptionView: NSViewRepresentable {
     let maxHeight: CGFloat
     var opacity: CGFloat = 0.96
     var maxLines: Int?
+    var isActive = true
 
     func makeNSView(context: Context) -> OverlayCaptionNSView {
         OverlayCaptionNSView()
     }
 
     func updateNSView(_ nsView: OverlayCaptionNSView, context: Context) {
-        nsView.update(caption: self.caption, context: self.context, fontSize: self.fontSize, opacity: self.opacity, reduceMotion: self.reduceMotion)
+        nsView.update(caption: self.caption, context: self.context, fontSize: self.fontSize, opacity: self.opacity, reduceMotion: self.reduceMotion, isActive: self.isActive)
     }
 
     func sizeThatFits(_ proposal: ProposedViewSize, nsView: OverlayCaptionNSView, context: Context) -> CGSize? {
@@ -283,7 +291,11 @@ final class OverlayCaptionNSView: NSView {
     // The caption must never take clicks or focus away from overlay controls or the target app.
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
-    func update(caption: OverlayCaptionText, context: OverlayCaptionText? = nil, fontSize: CGFloat, opacity: CGFloat, reduceMotion: Bool) {
+    func update(caption: OverlayCaptionText, context: OverlayCaptionText? = nil, fontSize: CGFloat, opacity: CGFloat, reduceMotion: Bool, isActive: Bool = true) {
+        guard isActive else {
+            if self.latestUpdate != nil { self.stopScrolling() }
+            return
+        }
         let update = Update(caption: caption, context: context)
         let styleChanged = self.fontSize != fontSize || self.opacity != opacity
         let motionChanged = self.reduceMotion != reduceMotion
@@ -338,13 +350,14 @@ final class OverlayCaptionNSView: NSView {
         guard let latestUpdate else { return }
         let context = self.reveal.displayed
         let caption = OverlayCaptionText.tail(context.text, limit: latestUpdate.caption.text.count, sourceOffset: context.sourceOffset)
-        let previousEnd = self.buffer.sourceOffset + self.buffer.text.utf16.count
-        if caption != self.buffer.preview {
-            let continuous = self.buffer.update(caption, context: context)
+        let previousBuffer = self.buffer
+        let previousEnd = previousBuffer.sourceOffset + previousBuffer.text.utf16.count
+        let continuous = self.buffer.update(caption, context: context)
+        if caption != previousBuffer.preview || self.buffer.text != previousBuffer.text || self.buffer.sourceOffset != previousBuffer.sourceOffset {
             if !continuous { self.contentOriginY = 0 }
             self.canAnimate = (self.pendingUpdate ? self.canAnimate : true) && continuous
             self.revealFromOffset = self.reduceMotion ? nil : continuous ? previousEnd : self.buffer.sourceOffset
-            self.setAccessibilityValue(caption.text)
+            if caption != previousBuffer.preview { self.setAccessibilityValue(caption.text) }
         } else if !resetLayout, !resetMotion {
             return
         }

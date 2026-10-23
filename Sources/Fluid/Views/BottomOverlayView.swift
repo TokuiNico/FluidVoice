@@ -3358,7 +3358,8 @@ struct BottomOverlayView: View {
             caption: self.contentState.captionPreview,
             context: self.contentState.captionContext,
             fontSize: self.layout.transFontSize,
-            maxHeight: max(1, self.previewMaxHeight - self.transcriptionVerticalPadding * 2)
+            maxHeight: max(1, self.previewMaxHeight - self.transcriptionVerticalPadding * 2),
+            isActive: self.contentState.isBottomOverlayPresented
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
@@ -3369,7 +3370,8 @@ struct BottomOverlayView: View {
             context: self.contentState.captionContext,
             fontSize: self.layout.transFontSize,
             maxHeight: self.previewMaxHeight,
-            maxLines: self.settings.overlaySize == .small ? 1 : nil
+            maxLines: self.settings.overlaySize == .small ? 1 : nil,
+            isActive: self.contentState.isBottomOverlayPresented
         )
         .frame(width: self.previewMaxWidth, alignment: .leading)
         .padding(
