@@ -129,8 +129,15 @@ class NotchContentState: ObservableObject {
     @Published var recordingTargetPID: pid_t? = nil
     var recordingTargetContext: TypingService.RecordingTargetContext?
 
-    /// Cached transcription preview text to avoid recomputing on every render
-    @Published private(set) var cachedPreviewText: String = ""
+    /// The preview keeps its source position so trimming cannot move wrapped caption lines.
+    @Published private(set) var captionPreview: OverlayCaptionText = .empty
+    var cachedPreviewText: String { self.captionPreview.text }
+    private var transcriptionSourceOffset = 0
+
+    /// Bounded recovery context for a revision or a chunk that skips past the short preview.
+    var captionContext: OverlayCaptionText {
+        OverlayCaptionText(text: self.transcriptionText, sourceOffset: self.transcriptionSourceOffset)
+    }
 
     // MARK: - Expanded Command Output State
 
@@ -235,35 +242,23 @@ class NotchContentState: ObservableObject {
 
     /// Update transcription and recompute cached lines
     func updateTranscription(_ text: String) {
-        let boundedText = Self.tailCharacters(in: text, maxCharacters: Self.maxStoredTranscriptionCharacters)
-        guard boundedText != self.transcriptionText else { return }
+        let bounded = OverlayCaptionText.tail(text, limit: Self.maxStoredTranscriptionCharacters)
+        guard bounded.text != self.transcriptionText || bounded.sourceOffset != self.transcriptionSourceOffset else { return }
 
-        self.transcriptionText = boundedText
+        self.transcriptionSourceOffset = bounded.sourceOffset
+        self.transcriptionText = bounded.text
         self.recomputeTranscriptionLines()
     }
 
     /// Recompute cached transcription lines (called only when text changes)
     private func recomputeTranscriptionLines() {
-        let text = self.transcriptionText
-
-        guard !text.isEmpty else {
-            if !self.cachedPreviewText.isEmpty {
-                self.cachedPreviewText = ""
-            }
-            return
-        }
-
-        let maxChars = SettingsStore.shared.transcriptionPreviewCharLimit
-        let previewText = Self.tailCharacters(in: text, maxCharacters: maxChars)
-        guard previewText != self.cachedPreviewText else { return }
-        self.cachedPreviewText = previewText
-    }
-
-    private static func tailCharacters(in text: String, maxCharacters: Int) -> String {
-        guard maxCharacters > 0, !text.isEmpty else { return "" }
-
-        let start = text.index(text.endIndex, offsetBy: -maxCharacters, limitedBy: text.startIndex) ?? text.startIndex
-        return String(text[start..<text.endIndex])
+        let preview = OverlayCaptionText.tail(
+            self.transcriptionText,
+            limit: SettingsStore.shared.transcriptionPreviewCharLimit,
+            sourceOffset: self.transcriptionSourceOffset
+        )
+        guard preview != self.captionPreview else { return }
+        self.captionPreview = preview
     }
 
     // MARK: - Recording State for Expanded View
@@ -1133,31 +1128,14 @@ struct NotchExpandedView: View {
             } else if self.presentationPolicy.showsStreamingPreview && self.hasTranscription && !self.contentState.isProcessing {
                 let previewText = self.visiblePreviewText
                 if !previewText.isEmpty {
-                    ScrollViewReader { proxy in
-                        ScrollView(.vertical, showsIndicators: false) {
-                            Text(previewText)
-                                .font(.fluidSystem(size: 10, weight: .medium))
-                                .foregroundStyle(.white.opacity(0.75))
-                                .multilineTextAlignment(.leading)
-                                .lineLimit(nil)
-                                .fixedSize(horizontal: false, vertical: true)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                            Color.clear.frame(height: 1).id("bottom")
-                        }
-                        .frame(width: self.previewMaxWidth, alignment: .leading)
-                        .frame(maxHeight: self.previewMaxHeight, alignment: .leading)
-                        .clipped()
-                        .onAppear {
-                            DispatchQueue.main.async {
-                                proxy.scrollTo("bottom", anchor: .bottom)
-                            }
-                        }
-                        .onChange(of: previewText) { _, _ in
-                            DispatchQueue.main.async {
-                                proxy.scrollTo("bottom", anchor: .bottom)
-                            }
-                        }
-                    }
+                    OverlayCaptionView(
+                        caption: self.contentState.captionPreview,
+                        context: self.contentState.captionContext,
+                        fontSize: 10,
+                        maxHeight: self.previewMaxHeight,
+                        opacity: 0.75
+                    )
+                    .frame(width: self.previewMaxWidth, alignment: .leading)
                     .frame(maxWidth: .infinity, alignment: .center)
                     .transition(.opacity.combined(with: .scale(scale: 0.95)))
                 }
@@ -1401,13 +1379,16 @@ struct NotchCompactBottomView: View {
 
     var body: some View {
         ZStack(alignment: .leading) {
-            Text(self.compactPreviewText)
-                .font(.fluidSystem(size: 9, weight: .medium))
-                .foregroundStyle(.white.opacity(0.82))
-                .lineLimit(1)
-                .truncationMode(.head)
-                .offset(y: self.shouldShowPreview ? 0 : -4)
-                .opacity(self.shouldShowPreview ? 1 : 0)
+            OverlayCaptionView(
+                caption: self.contentState.captionPreview,
+                context: self.contentState.captionContext,
+                fontSize: 9,
+                maxHeight: self.previewHeight,
+                opacity: 0.82,
+                maxLines: 1
+            )
+            .offset(y: self.shouldShowPreview ? 0 : -4)
+            .opacity(self.shouldShowPreview ? 1 : 0)
         }
         .frame(width: self.previewWidth, height: SettingsStore.shared.enableStreamingPreview ? self.previewHeight : 0, alignment: .leading)
         .padding(.horizontal, SettingsStore.shared.enableStreamingPreview ? 10 : 0)
@@ -1447,8 +1428,12 @@ struct NotchCommandOutputExpandedView: View {
     private var dynamicHeight: CGFloat {
         let baseHeight: CGFloat = 120 // Minimum height
         let contentHeight = self.estimateContentHeight()
+        // Reserve the caption's full height while recording so its wrapped lines
+        // cannot squeeze the header and follow-up input out of the window.
+        let captionHeight = self.contentState.isRecordingInExpandedMode && !self.contentState.cachedPreviewText.isEmpty
+            ? self.previewMaxHeight + 12 : 0
         let maxHeight = (NSScreen.main?.frame.height ?? 800) * 0.45 // 45% of screen
-        return min(max(baseHeight, contentHeight), maxHeight)
+        return min(max(baseHeight, contentHeight) + captionHeight, maxHeight)
     }
 
     private func estimateContentHeight() -> CGFloat {
@@ -1652,30 +1637,14 @@ struct NotchCommandOutputExpandedView: View {
             if self.contentState.isRecordingInExpandedMode && !self.contentState.transcriptionText.isEmpty {
                 let previewText = self.contentState.cachedPreviewText
                 if !previewText.isEmpty {
-                    ScrollViewReader { proxy in
-                        ScrollView(.vertical, showsIndicators: false) {
-                            Text(previewText)
-                                .font(.fluidSystem(size: 11, weight: .medium))
-                                .foregroundStyle(.white.opacity(0.75))
-                                .multilineTextAlignment(.leading)
-                                .lineLimit(nil)
-                                .fixedSize(horizontal: false, vertical: true)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                            Color.clear.frame(height: 1).id("bottom")
-                        }
-                        .frame(maxWidth: .infinity, maxHeight: self.previewMaxHeight)
-                        .clipped()
-                        .onAppear {
-                            DispatchQueue.main.async {
-                                proxy.scrollTo("bottom", anchor: .bottom)
-                            }
-                        }
-                        .onChange(of: previewText) { _, _ in
-                            DispatchQueue.main.async {
-                                proxy.scrollTo("bottom", anchor: .bottom)
-                            }
-                        }
-                    }
+                    OverlayCaptionView(
+                        caption: self.contentState.captionPreview,
+                        context: self.contentState.captionContext,
+                        fontSize: 11,
+                        maxHeight: self.previewMaxHeight,
+                        opacity: 0.75
+                    )
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 6)
                     .background(self.commandRed.opacity(0.1))
@@ -1684,7 +1653,6 @@ struct NotchCommandOutputExpandedView: View {
             }
         }
         .animation(.easeInOut(duration: 0.2), value: self.contentState.isRecordingInExpandedMode)
-        .animation(.easeInOut(duration: 0.15), value: self.contentState.transcriptionText)
     }
 
     // MARK: - Conversation Area

@@ -2674,6 +2674,9 @@ final class HotkeyShortcutTests: XCTestCase {
         controller.show(audioPublisher: audioPublisher, mode: .dictation)
         let emptySize = try XCTUnwrap(controller.windowSizeForTests)
 
+        // Captions now reserve their line slots. Use the large preset to leave a
+        // genuinely different old frame for the reopen path to discard.
+        SettingsStore.shared.overlaySize = .large
         NotchContentState.shared.updateTranscription(String(repeating: "multiline preview text ", count: 30))
         controller.refreshSizeForContent()
         // SwiftUI layout can finish after 120 ms on a busy host; await the actual resize.
@@ -2684,6 +2687,7 @@ final class HotkeyShortcutTests: XCTestCase {
         let expandedSize = try XCTUnwrap(controller.windowSizeForTests)
         XCTAssertGreaterThan(expandedSize.height, emptySize.height)
 
+        SettingsStore.shared.overlaySize = .medium
         _ = await controller.hideAndWait()
         try await Task.sleep(nanoseconds: 100_000_000)
         controller.show(audioPublisher: audioPublisher, mode: .dictation)
