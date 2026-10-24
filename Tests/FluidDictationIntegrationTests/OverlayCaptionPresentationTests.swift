@@ -607,6 +607,16 @@ final class OverlayCaptionPresentationTests: XCTestCase {
     }
 
     func testCaptionSurfaces() async throws {
+        func checkpoint(_ phase: String) {
+            let message = "Caption surface pid=\(ProcessInfo.processInfo.processIdentifier) phase=\(phase)\n"
+            FileHandle.standardError.write(Data(message.utf8))
+            let trace = URL(fileURLWithPath: #filePath).resolvingSymlinksInPath()
+                .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+                .appendingPathComponent("build/test-results/caption-phase.txt")
+            try? message.write(to: trace, atomically: true, encoding: .utf8)
+        }
+        checkpoint("begin")
+        defer { checkpoint("finished") }
         let settings = SettingsStore.shared
         let state = NotchContentState.shared
         let previousSize = settings.overlaySize
@@ -644,8 +654,10 @@ final class OverlayCaptionPresentationTests: XCTestCase {
             "This sentence continues beyond the preview limit so we can check that wrapping stays stable throughout a longer recording.").split(separator: " ")
         let audio = Just(CGFloat.zero).eraseToAnyPublisher()
         for size in [SettingsStore.OverlaySize.small, .medium, .large] {
+            checkpoint("\(size)-settings")
             settings.overlaySize = size
             state.updateTranscription("")
+            checkpoint("\(size)-create-host")
             let host = NSHostingView(rootView: VStack(spacing: 22) {
                 Text("\(size.rawValue.capitalized) · top notch / compact notch / bottom overlay").foregroundStyle(.white)
                 HStack(alignment: .top, spacing: 24) {
@@ -662,11 +674,9 @@ final class OverlayCaptionPresentationTests: XCTestCase {
             .frame(width: 1000, height: 680)
             .background(Color(white: 0.12))
             .appTheme(.dark))
+            checkpoint("\(size)-mount-host")
             window.contentView = host
-            window.orderFrontRegardless()
-            host.layoutSubtreeIfNeeded()
-            window.displayIfNeeded()
-            CATransaction.flush()
+            checkpoint("\(size)-stream")
             if review { window.center(); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true) }
             for index in stride(from: 0, to: words.count, by: review ? 3 : 1) {
                 let latest = words[...min(index + (review ? 2 : 0), words.count - 1)].joined(separator: " ")
@@ -679,6 +689,7 @@ final class OverlayCaptionPresentationTests: XCTestCase {
                 try await Task.sleep(for: .milliseconds(review ? 450 : 1))
             }
             try await Task.sleep(for: .milliseconds(300))
+            checkpoint("\(size)-snapshot")
             host.layoutSubtreeIfNeeded()
             XCTAssertEqual(host.frame.width, 1000)
             print("Caption surface snapshot starting: \(size), \(self.visibilityState(host))")
