@@ -6,6 +6,19 @@ import XCTest
 
 @MainActor
 final class OverlayCaptionPresentationTests: XCTestCase {
+    private func animationState(_ layer: CALayer?) -> String {
+        guard let layer else { return "no layer" }
+        return (layer.animationKeys() ?? []).map { key in
+            guard let animation = layer.animation(forKey: key) else { return key }
+            return "\(key): begin=\(animation.beginTime), duration=\(animation.duration), localNow=\(layer.convertTime(CACurrentMediaTime(), from: nil)), speed=\(layer.speed), removed=\(animation.isRemovedOnCompletion)"
+        }.joined(separator: "; ")
+    }
+
+    private func visibilityState(_ view: NSView) -> String {
+        "hidden=\(view.isHiddenOrHasHiddenAncestor), frame=\(view.frame), visible=\(view.window?.isVisible ?? false), alpha=\(view.window?.alphaValue ?? 0), " +
+            "occlusion=\(view.window?.occlusionState.rawValue ?? 0), reduceMotion=\(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)"
+    }
+
     func testQueuedAppActivationDoesNotRestoreTheDismissedTarget() async {
         let monitor = ActiveAppMonitor.shared
         let state = NotchContentState.shared
@@ -159,8 +172,9 @@ final class OverlayCaptionPresentationTests: XCTestCase {
                 XCTAssertNotNil(container.hitTest(NSPoint(x: container.bounds.midX, y: container.bounds.midY)), "Visible pill controls must remain clickable")
             }
             let waitingViews = shimmers(in: host)
-            XCTAssertFalse(waitingViews.isEmpty, "Exercise the real waiting view for \(size)")
-            XCTAssertTrue(waitingViews.contains { $0.layer?.sublayers?.first?.animation(forKey: "fluid.shimmer.locations") != nil }, "Visible processing must still shimmer for \(size)")
+            XCTAssertFalse(waitingViews.isEmpty, "Exercise the real waiting view for \(size): \(self.visibilityState(host)), processing=\(state.isProcessing), muted=\(state.isDictationMuted)")
+            let visibility = waitingViews.map { self.visibilityState($0) }.joined(separator: "; ")
+            XCTAssertTrue(waitingViews.contains { $0.layer?.sublayers?.first?.animation(forKey: "fluid.shimmer.locations") != nil }, "Visible processing must still shimmer for \(size): \(visibility), presented=\(state.isBottomOverlayPresented)")
             if let output = ProcessInfo.processInfo.environment["CAPTION_TEST_OUTPUT"] {
                 let bitmap = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
                 host.cacheDisplay(in: host.bounds, to: bitmap)
@@ -244,7 +258,7 @@ final class OverlayCaptionPresentationTests: XCTestCase {
         XCTAssertEqual(zip(before, after).filter { $0 != $1 }.count, 1, "Redraw the corrected visible line while preserving both unchanged lines")
         XCTAssertEqual(view.accessibilityValue() as? String, OverlayCaptionText.tail(corrected, limit: 50).text)
         XCTAssertEqual(view.layer?.sublayerTransform.m42, 0)
-        XCTAssertTrue(view.layer?.animationKeys()?.isEmpty ?? true)
+        XCTAssertTrue(view.layer?.animationKeys()?.isEmpty ?? true, self.animationState(view.layer))
     }
 
     func testWordsAppearInStepsWithACompositorFade() async throws {
@@ -273,7 +287,7 @@ final class OverlayCaptionPresentationTests: XCTestCase {
         XCTAssertLessThan(intermediate.count, phrase.count)
         try await Task.sleep(for: .milliseconds(480))
         XCTAssertEqual(view.accessibilityValue() as? String, phrase)
-        XCTAssertTrue(fade.animationKeys()?.isEmpty ?? true)
+        XCTAssertTrue(fade.animationKeys()?.isEmpty ?? true, self.animationState(fade))
         let bitmap = try XCTUnwrap(NSBitmapImageRep(
             bitmapDataPlanes: nil,
             pixelsWide: 304,
@@ -397,7 +411,7 @@ final class OverlayCaptionPresentationTests: XCTestCase {
         update(prefix + "\nNext word at a time")
         XCTAssertEqual(try XCTUnwrap(view.layer?.animation(forKey: "captionScroll")).beginTime, begin)
         try await Task.sleep(for: .milliseconds(160))
-        XCTAssertTrue(view.layer?.animationKeys()?.isEmpty ?? true, "Same-line words must not prolong scrolling")
+        XCTAssertTrue(view.layer?.animationKeys()?.isEmpty ?? true, "Same-line words must not prolong scrolling: \(self.animationState(view.layer))")
         XCTAssertEqual(
             try XCTUnwrap(view.layer?.presentation()).sublayerTransform.m42,
             try XCTUnwrap(view.layer).sublayerTransform.m42,
@@ -430,9 +444,9 @@ final class OverlayCaptionPresentationTests: XCTestCase {
         XCTAssertEqual(view.layer?.sublayerTransform.m42, target)
         try await Task.sleep(for: .milliseconds(300))
         XCTAssertEqual(try XCTUnwrap(view.layer?.presentation()).sublayerTransform.m42, target, accuracy: 0.5)
-        XCTAssertTrue(view.layer?.animationKeys()?.isEmpty ?? true)
+        XCTAssertTrue(view.layer?.animationKeys()?.isEmpty ?? true, self.animationState(view.layer))
         update("First line\nSecond line\nThird word\nFourth", reduceMotion: true)
-        XCTAssertTrue(view.layer?.animationKeys()?.isEmpty ?? true)
+        XCTAssertTrue(view.layer?.animationKeys()?.isEmpty ?? true, self.animationState(view.layer))
         view.frame.size.height = 16
         update("First line\nSecond line\nThird word\nFourth\nFifth\nLatest caption", reduceMotion: true)
         try await Task.sleep(for: .milliseconds(50))
@@ -515,7 +529,7 @@ final class OverlayCaptionPresentationTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(35))
         let host = try XCTUnwrap(controller.contentViewForTests)
         let view = try XCTUnwrap(caption(in: host))
-        XCTAssertNotEqual(view.accessibilityValue() as? String, state.cachedPreviewText)
+        XCTAssertNotEqual(view.accessibilityValue() as? String, state.cachedPreviewText, self.visibilityState(view))
         controller.hideImmediately()
         for _ in 0..<30 where state.isBottomOverlayPresented {
             try await Task.sleep(for: .milliseconds(10))
@@ -634,10 +648,12 @@ final class OverlayCaptionPresentationTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(300))
             host.layoutSubtreeIfNeeded()
             XCTAssertEqual(host.frame.width, 1000)
+            print("Caption surface snapshot starting: \(size), \(self.visibilityState(host))")
             let bitmap = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
             host.cacheDisplay(in: host.bounds, to: bitmap)
             let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
             let attachment = XCTAttachment(data: png, uniformTypeIdentifier: "public.png")
+            print("Caption surface snapshot completed: \(size)")
             attachment.name = "caption-\(size.rawValue)"
             attachment.lifetime = .keepAlways
             add(attachment)
