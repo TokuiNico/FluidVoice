@@ -430,6 +430,13 @@ extension VoiceEngineSettingsView {
                             .background(Capsule().fill(Color.fluidGreen.opacity(0.25)))
                             .foregroundStyle(Color.fluidGreen)
                     } else {
+                        // A failed or cancelled locale download leaves Apple Speech configured but not ready.
+                        // Keep the picker so people can switch back to an installed locale.
+                        if isConfiguredActive, model == .appleSpeechAnalyzer {
+                            self.appleSpeechLocalePickerButton
+                                .disabled(self.viewModel.areSpeechModelActionsBlocked)
+                        }
+
                         Button("Activate") {
                             self.viewModel.activateSpeechModel(model)
                         }
