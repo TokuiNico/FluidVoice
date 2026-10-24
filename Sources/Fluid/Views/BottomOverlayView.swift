@@ -2270,7 +2270,7 @@ private struct PromptSelectorAnchorReader: NSViewRepresentable {
 
     func updateNSView(_ nsView: AnchorReportingView, context: Context) {
         nsView.onFrameChange = self.onFrameChange
-        nsView.reportFrame(force: true)
+        DispatchQueue.main.async { [weak nsView] in nsView?.reportFrame(force: true) }
     }
 
     final class AnchorReportingView: NSView {
