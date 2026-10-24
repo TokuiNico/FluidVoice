@@ -1150,7 +1150,7 @@ struct ContentView: View {
             switch old {
             case .commandMode:
                 // Close expanded command output notch if visible
-                if NotchOverlayManager.shared.isCommandOutputExpanded {
+                if NotchOverlayManager.shared.hasCommandOutputToDismiss {
                     DebugLogger.shared.debug("Closing expanded command notch on mode transition", source: "ContentView")
                     NotchOverlayManager.shared.hideExpandedCommandOutput()
                 }
@@ -5165,7 +5165,7 @@ struct ContentView: View {
             DictionaryCorrectionOverlayController.shared.dismiss()
             return .dismissedOverlay
         }
-        if NotchOverlayManager.shared.isCommandOutputExpanded {
+        if NotchOverlayManager.shared.hasCommandOutputToDismiss {
             NotchOverlayManager.shared.hideExpandedCommandOutput()
             NotchOverlayManager.shared.onCommandOutputDismiss?()
             handled = true

@@ -422,17 +422,23 @@ struct ShimmerText: View {
 }
 
 struct CompositorShimmerSweep: NSViewRepresentable {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var duration: CFTimeInterval = 1.0
     var peakOpacity: CGFloat = 0.88
+    var isActive = true
 
     func makeNSView(context: Context) -> CompositorShimmerSweepView {
         let view = CompositorShimmerSweepView()
-        view.configure(duration: self.duration, peakOpacity: self.peakOpacity)
+        view.configure(duration: self.duration, peakOpacity: self.peakOpacity, isActive: self.isActive && !self.reduceMotion)
         return view
     }
 
     func updateNSView(_ nsView: CompositorShimmerSweepView, context: Context) {
-        nsView.configure(duration: self.duration, peakOpacity: self.peakOpacity)
+        nsView.configure(duration: self.duration, peakOpacity: self.peakOpacity, isActive: self.isActive && !self.reduceMotion)
+    }
+
+    static func dismantleNSView(_ nsView: CompositorShimmerSweepView, coordinator: ()) {
+        nsView.configure(duration: 1, peakOpacity: 0, isActive: false)
     }
 }
 
@@ -440,6 +446,8 @@ final class CompositorShimmerSweepView: NSView {
     private let gradientLayer = CAGradientLayer()
     private var animationDuration: CFTimeInterval = 1.0
     private var peakOpacity: CGFloat = 0.88
+    private var isActive = true
+    private var visibilitySubscriptions = Set<AnyCancellable>()
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -471,14 +479,35 @@ final class CompositorShimmerSweepView: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        if self.window == nil {
-            self.gradientLayer.removeAnimation(forKey: "fluid.shimmer.locations")
-        } else {
-            self.startAnimationIfNeeded()
+        self.visibilitySubscriptions.removeAll()
+        if let window {
+            NotificationCenter.default.publisher(for: NSWindow.didChangeOcclusionStateNotification)
+                .filter { [weak window] in $0.object as? NSWindow === window }
+                .sink { [weak self] _ in self?.updateAnimation() }
+                .store(in: &self.visibilitySubscriptions)
+            // Alpha-zero panels remain ordered in. Stop on that property change
+            // immediately; occlusion notifications arrive later from WindowServer.
+            window.publisher(for: \.alphaValue, options: [.new])
+                .sink { [weak self] _ in self?.updateAnimation() }
+                .store(in: &self.visibilitySubscriptions)
+            window.publisher(for: \.isVisible, options: [.new])
+                .sink { [weak self] _ in self?.updateAnimation() }
+                .store(in: &self.visibilitySubscriptions)
         }
+        self.updateAnimation()
     }
 
-    func configure(duration: CFTimeInterval, peakOpacity: CGFloat) {
+    override func viewDidHide() {
+        super.viewDidHide()
+        self.updateAnimation()
+    }
+
+    override func viewDidUnhide() {
+        super.viewDidUnhide()
+        self.updateAnimation()
+    }
+
+    func configure(duration: CFTimeInterval, peakOpacity: CGFloat, isActive: Bool = true) {
         let clampedDuration = max(duration, 0.2)
         let clampedOpacity = min(max(peakOpacity, 0.0), 1.0)
         let shouldRestart = abs(self.animationDuration - clampedDuration) > 0.01
@@ -486,12 +515,14 @@ final class CompositorShimmerSweepView: NSView {
 
         self.animationDuration = clampedDuration
         self.peakOpacity = clampedOpacity
+        self.isActive = isActive
         if shouldUpdateColors {
             self.updateColors()
         }
         if shouldRestart {
-            self.startAnimationIfNeeded()
+            self.gradientLayer.removeAnimation(forKey: "fluid.shimmer.locations")
         }
+        self.updateAnimation()
     }
 
     private func updateColors() {
@@ -502,9 +533,15 @@ final class CompositorShimmerSweepView: NSView {
         ]
     }
 
-    private func startAnimationIfNeeded() {
-        guard self.window != nil else { return }
-        self.gradientLayer.removeAnimation(forKey: "fluid.shimmer.locations")
+    private func updateAnimation() {
+        guard self.isActive, !self.isHiddenOrHasHiddenAncestor,
+              let window = self.window, window.isVisible, window.alphaValue > 0,
+              window.occlusionState.contains(.visible)
+        else {
+            self.gradientLayer.removeAnimation(forKey: "fluid.shimmer.locations")
+            return
+        }
+        guard self.gradientLayer.animation(forKey: "fluid.shimmer.locations") == nil else { return }
 
         let animation = CABasicAnimation(keyPath: "locations")
         animation.fromValue = [-0.45, -0.15, 0.15]
@@ -1414,6 +1451,7 @@ struct NotchCommandOutputExpandedView: View {
     @State private var inputText: String = ""
     @FocusState private var isInputFocused: Bool
     @State private var scrollProxy: ScrollViewProxy?
+    @State private var pendingScrollWorkItem: DispatchWorkItem?
     @State private var isHoveringNewChat = false
     @State private var isHoveringRecent = false
     @State private var isHoveringClear = false
@@ -1689,6 +1727,11 @@ struct NotchCommandOutputExpandedView: View {
                 // Always scroll to bottom when view appears
                 self.scrollToBottom(proxy, animated: false)
             }
+            .onDisappear {
+                self.pendingScrollWorkItem?.cancel()
+                self.pendingScrollWorkItem = nil
+                self.scrollProxy = nil
+            }
             .onChange(of: self.contentState.commandConversationHistory.count) { _, _ in
                 self.scrollToBottom(proxy, animated: true)
             }
@@ -1704,7 +1747,10 @@ struct NotchCommandOutputExpandedView: View {
     }
 
     private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool = true) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+        guard self.pendingScrollWorkItem == nil else { return }
+        let work = DispatchWorkItem {
+            self.pendingScrollWorkItem = nil
+            guard self.scrollProxy != nil else { return }
             if animated {
                 withAnimation(.easeOut(duration: 0.15)) {
                     proxy.scrollTo("bottom", anchor: .bottom)
@@ -1713,6 +1759,8 @@ struct NotchCommandOutputExpandedView: View {
                 proxy.scrollTo("bottom", anchor: .bottom)
             }
         }
+        self.pendingScrollWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: work)
     }
 
     // MARK: - Message Views

@@ -6,6 +6,206 @@ import XCTest
 
 @MainActor
 final class OverlayCaptionPresentationTests: XCTestCase {
+    func testQueuedAppActivationDoesNotRestoreTheDismissedTarget() async {
+        let monitor = ActiveAppMonitor.shared
+        let state = NotchContentState.shared
+        let previousIcon = state.targetAppIcon
+        defer { monitor.stopMonitoring(); state.targetAppIcon = previousIcon }
+        monitor.startMonitoring()
+        NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.didActivateApplicationNotification, object: nil)
+        monitor.stopMonitoring()
+        state.targetAppIcon = nil
+        await Task.yield()
+        await Task.yield()
+        XCTAssertNil(monitor.activeApp)
+        XCTAssertNil(monitor.activeAppIcon)
+        XCTAssertNil(state.targetAppIcon, "An already queued activation must not repopulate a dismissed overlay")
+    }
+
+    func testDismissCancelsACommandPanelThatHasNotOpenedYet() async throws {
+        let settings = SettingsStore.shared
+        let previousPosition = settings.overlayPosition
+        let previousMode = settings.notchPresentationMode
+        let manager = NotchOverlayManager.shared
+        defer {
+            manager.hideExpandedCommandOutput()
+            settings.overlayPosition = previousPosition
+            settings.notchPresentationMode = previousMode
+        }
+        settings.overlayPosition = .top
+        settings.notchPresentationMode = .standard
+        XCTAssertTrue(manager.canShowExpandedCommandOutput)
+        for _ in 0..<3 {
+            manager.showExpandedCommandOutput()
+            XCTAssertTrue(manager.hasCommandOutputToDismiss, "Escape and mode changes must recognize the pending panel")
+            manager.hideExpandedCommandOutput()
+            XCTAssertFalse(manager.hasCommandOutputToDismiss)
+        }
+        try await Task.sleep(for: .milliseconds(350))
+        XCTAssertFalse(manager.isCommandOutputExpanded, "A canceled delayed presentation must not reopen the command panel")
+        XCTAssertFalse(NotchContentState.shared.isExpandedForCommandOutput)
+        manager.showExpandedCommandOutput()
+        try await Task.sleep(for: .milliseconds(350))
+        XCTAssertTrue(manager.isCommandOutputExpanded, "Cancellation must not block a fresh presentation")
+        manager.hideExpandedCommandOutput()
+        try await Task.sleep(for: .milliseconds(350))
+        XCTAssertFalse(manager.isCommandOutputExpanded)
+    }
+
+    func testNewRecordingSupersedesPendingCommandOutput() async throws {
+        let settings = SettingsStore.shared
+        let previousPosition = settings.overlayPosition
+        let previousMode = settings.notchPresentationMode
+        let manager = NotchOverlayManager.shared
+        defer {
+            manager.hideImmediately()
+            manager.hideExpandedCommandOutput()
+            settings.overlayPosition = previousPosition
+            settings.notchPresentationMode = previousMode
+        }
+        settings.overlayPosition = .bottom
+        settings.notchPresentationMode = .standard
+        manager.showExpandedCommandOutput()
+        manager.show(audioLevelPublisher: Just(CGFloat.zero).eraseToAnyPublisher(), mode: .dictation)
+        manager.updateTranscriptionText("The new dictation owns the preview")
+        try await Task.sleep(for: .milliseconds(350))
+        XCTAssertFalse(manager.isCommandOutputExpanded)
+        XCTAssertFalse(manager.hasCommandOutputToDismiss)
+        XCTAssertTrue(manager.isBottomOverlayVisible)
+        XCTAssertEqual(NotchContentState.shared.mode, .dictation)
+        XCTAssertEqual(NotchContentState.shared.transcriptionText, "The new dictation owns the preview")
+        manager.hideImmediately()
+        try await Task.sleep(for: .milliseconds(150))
+    }
+
+    func testManagerHideStopsHiddenUpdatesAndDoesNotResizeTheParkedPanel() async throws {
+        let settings = SettingsStore.shared
+        let state = NotchContentState.shared
+        let previousPosition = settings.overlayPosition
+        let previousSize = settings.overlaySize
+        let previousPreview = settings.enableStreamingPreview
+        let manager = NotchOverlayManager.shared
+        let controller = BottomOverlayWindowController.shared
+        let levels = PassthroughSubject<CGFloat, Never>()
+        defer {
+            manager.hideImmediately()
+            settings.overlayPosition = previousPosition
+            settings.overlaySize = previousSize
+            settings.enableStreamingPreview = previousPreview
+        }
+        settings.overlayPosition = .bottom
+        settings.overlaySize = .medium
+        settings.enableStreamingPreview = true
+        manager.show(audioLevelPublisher: levels.eraseToAnyPublisher(), mode: .dictation)
+        manager.updateTranscriptionText("These pending words must stop when the whole dictation overlay has finished its work.")
+        manager.setProcessing(true)
+        try await Task.sleep(for: .milliseconds(40))
+        manager.hideImmediately()
+        XCTAssertTrue(controller.isVisuallyHiddenForTests)
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertFalse(state.isBottomOverlayPresented, "The manager must preserve bottom-panel cleanup")
+        XCTAssertFalse(state.isProcessing)
+        XCTAssertFalse(state.isBottomOverlayDismissing)
+        XCTAssertFalse(state.isBottomOverlayReleaseTransitioning)
+        let panel = try XCTUnwrap(controller.contentViewForTests?.window)
+        let anchor = CGRect(x: panel.frame.minX + 10, y: panel.frame.minY + 10, width: 80, height: 24)
+        let visibleWindows = Set(NSApp.windows.filter { $0.isVisible && $0.alphaValue > 0 }.map(\.windowNumber))
+        BottomOverlayPromptMenuController.shared.updateAnchor(selectorFrameInScreen: anchor, parentWindow: panel, maxWidth: 220, menuGap: 6)
+        BottomOverlayModeMenuController.shared.updateAnchor(selectorFrameInScreen: anchor, parentWindow: panel, maxWidth: 220, menuGap: 6)
+        BottomOverlayActionsMenuController.shared.updateAnchor(selectorFrameInScreen: anchor, parentWindow: panel, maxWidth: 220, menuGap: 6)
+        BottomOverlayPromptMenuController.shared.toggleFromTap()
+        BottomOverlayModeMenuController.shared.toggleFromTap()
+        BottomOverlayActionsMenuController.shared.toggleFromTap()
+        XCTAssertEqual(Set(NSApp.windows.filter { $0.isVisible && $0.alphaValue > 0 }.map(\.windowNumber)), visibleWindows, "A late menu action must not reopen controls from a hidden overlay")
+        let parkedSize = controller.windowSizeForTests
+        levels.send(0.9)
+        settings.overlaySize = .large
+        controller.refreshSizeForContent()
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(OverlayAudioLevelState.shared.level, 0, "Hidden panels must unsubscribe from audio levels")
+        XCTAssertEqual(controller.windowSizeForTests, parkedSize, "Settings and stale resize requests must not lay out a hidden panel")
+        manager.show(audioLevelPublisher: levels.eraseToAnyPublisher(), mode: .dictation)
+        manager.hideImmediately()
+        manager.show(audioLevelPublisher: levels.eraseToAnyPublisher(), mode: .dictation)
+        manager.updateTranscriptionText("Only the new recording may remain visible")
+        try await Task.sleep(for: .milliseconds(500))
+        XCTAssertTrue(state.isBottomOverlayPresented)
+        XCTAssertFalse(controller.isVisuallyHiddenForTests)
+        XCTAssertEqual(state.transcriptionText, "Only the new recording may remain visible")
+        manager.hideImmediately()
+        try await Task.sleep(for: .milliseconds(200))
+    }
+
+    func testProcessingShimmerStopsAcrossEveryBottomSize() async throws {
+        let settings = SettingsStore.shared
+        let state = NotchContentState.shared
+        let previousSize = settings.overlaySize
+        let previousProcessing = state.isProcessing
+        let controller = BottomOverlayWindowController.shared
+        defer { controller.hideImmediately(); settings.overlaySize = previousSize; state.isProcessing = previousProcessing }
+        func shimmers(in view: NSView) -> [CompositorShimmerSweepView] {
+            (view as? CompositorShimmerSweepView).map { [$0] } ?? view.subviews.flatMap { shimmers(in: $0) }
+        }
+        for size in [SettingsStore.OverlaySize.pill, .small, .medium, .large] {
+            settings.overlaySize = size
+            controller.show(audioPublisher: Just(CGFloat.zero).eraseToAnyPublisher(), mode: .dictation)
+            controller.setProcessing(true)
+            try await Task.sleep(for: .milliseconds(180))
+            let host = try XCTUnwrap(controller.contentViewForTests)
+            XCTAssertEqual(host.frame.size, host.superview?.bounds.size, "Hosting content must fit its window after every preset change")
+            if size == .pill {
+                let container = try XCTUnwrap(host.window?.contentView)
+                XCTAssertNil(container.hitTest(NSPoint(x: 1, y: 1)), "Transparent padding must not intercept clicks")
+                XCTAssertNotNil(container.hitTest(NSPoint(x: container.bounds.midX, y: container.bounds.midY)), "Visible pill controls must remain clickable")
+            }
+            let waitingViews = shimmers(in: host)
+            XCTAssertFalse(waitingViews.isEmpty, "Exercise the real waiting view for \(size)")
+            XCTAssertTrue(waitingViews.contains { $0.layer?.sublayers?.first?.animation(forKey: "fluid.shimmer.locations") != nil }, "Visible processing must still shimmer for \(size)")
+            if let output = ProcessInfo.processInfo.environment["CAPTION_TEST_OUTPUT"] {
+                let bitmap = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+                host.cacheDisplay(in: host.bounds, to: bitmap)
+                let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+                try png.write(to: URL(fileURLWithPath: output).appendingPathComponent("processing-\(size.rawValue).png"))
+            }
+            controller.hideImmediately()
+            try await Task.sleep(for: .milliseconds(300))
+            XCTAssertFalse(state.isBottomOverlayPresented)
+            XCTAssertTrue(waitingViews.allSatisfy { $0.layer?.sublayers?.first?.animationKeys()?.isEmpty != false }, "No waiting shimmer may survive dismissal for \(size)")
+        }
+    }
+
+    func testWaitingShimmerStopsWhenItsViewOrWindowIsHidden() async throws {
+        let view = CompositorShimmerSweepView(frame: CGRect(x: 0, y: 0, width: 100, height: 20))
+        let window = NSWindow(contentRect: view.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.animationBehavior = .none
+        window.contentView = view
+        window.orderFrontRegardless()
+        defer { window.orderOut(nil); window.contentView = nil; window.close() }
+        try await Task.sleep(for: .milliseconds(50))
+        let gradient = try XCTUnwrap(view.layer?.sublayers?.first)
+        XCTAssertNotNil(gradient.animation(forKey: "fluid.shimmer.locations"))
+        window.alphaValue = 0
+        XCTAssertNil(gradient.animation(forKey: "fluid.shimmer.locations"), "A cached alpha-zero panel must stop immediately")
+        window.alphaValue = 1
+        XCTAssertNotNil(gradient.animation(forKey: "fluid.shimmer.locations"))
+        view.isHidden = true
+        XCTAssertNil(gradient.animation(forKey: "fluid.shimmer.locations"), "A retained hidden view must stop its infinite shimmer")
+        view.isHidden = false
+        XCTAssertNotNil(gradient.animation(forKey: "fluid.shimmer.locations"))
+        window.orderOut(nil)
+        XCTAssertNil(gradient.animation(forKey: "fluid.shimmer.locations"), "Ordering out a retained window must stop the shimmer")
+        window.orderFrontRegardless()
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertNotNil(gradient.animation(forKey: "fluid.shimmer.locations"))
+        view.configure(duration: 1, peakOpacity: 0.88, isActive: false)
+        XCTAssertNil(gradient.animation(forKey: "fluid.shimmer.locations"), "Inactive and Reduce Motion presentations must remain static")
+        view.configure(duration: 1, peakOpacity: 0.88, isActive: true)
+        XCTAssertNotNil(gradient.animation(forKey: "fluid.shimmer.locations"))
+        window.contentView = nil
+        XCTAssertNil(gradient.animation(forKey: "fluid.shimmer.locations"))
+    }
+
     func testRetainedVisibleLineUpdatesWhenTheShortPreviewIsUnchanged() async throws {
         let view = OverlayCaptionNSView(frame: CGRect(x: 0, y: 0, width: 304, height: 54))
         let window = NSWindow(contentRect: view.frame, styleMask: [.borderless], backing: .buffered, defer: false)
@@ -313,7 +513,7 @@ final class OverlayCaptionPresentationTests: XCTestCase {
         let text = "The hidden preview must stop revealing this long sentence while preserving the transcript for the next action."
         state.updateTranscription(text)
         try await Task.sleep(for: .milliseconds(35))
-        let host = try XCTUnwrap(NSApp.windows.compactMap { $0.contentView as? NSHostingView<BottomOverlayView> }.first)
+        let host = try XCTUnwrap(controller.contentViewForTests)
         let view = try XCTUnwrap(caption(in: host))
         XCTAssertNotEqual(view.accessibilityValue() as? String, state.cachedPreviewText)
         controller.hideImmediately()

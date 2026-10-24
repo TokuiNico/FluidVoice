@@ -27,6 +27,7 @@ final class BottomOverlayWindowController {
     static let shared = BottomOverlayWindowController()
 
     private var window: NSPanel?
+    private var hostingView: BottomOverlayHostingView?
     private var audioSubscription: AnyCancellable?
     private var pendingResizeWorkItem: DispatchWorkItem?
     private var pendingReleaseTransitionResetWorkItem: DispatchWorkItem?
@@ -55,6 +56,7 @@ final class BottomOverlayWindowController {
         self.audioSubscription = nil
         self.window?.orderOut(nil)
         self.window = nil
+        self.hostingView = nil
     }
 
     var isParkedOffscreenForTests: Bool {
@@ -65,6 +67,8 @@ final class BottomOverlayWindowController {
     var windowSizeForTests: NSSize? {
         self.window?.frame.size
     }
+
+    var contentViewForTests: NSView? { self.hostingView }
 
     private init() {
         NotificationCenter.default.addObserver(forName: NSNotification.Name("OverlayOffsetChanged"), object: nil, queue: .main) { [weak self] _ in
@@ -333,6 +337,7 @@ final class BottomOverlayWindowController {
         self.pendingIgnoreMouseWorkItem?.cancel()
         let workItem = DispatchWorkItem { [weak self] in
             guard let self, self.window?.alphaValue == 0 else { return }
+            self.pendingIgnoreMouseWorkItem = nil
             let startedAt = ProcessInfo.processInfo.systemUptime
             self.window?.ignoresMouseEvents = true
             DebugLogger.shared.debug(
@@ -484,6 +489,7 @@ final class BottomOverlayWindowController {
         self.pendingResizeWorkItem?.cancel()
         self.pendingResizeWorkItem = nil
         self.pendingReleaseTransitionResetWorkItem?.cancel()
+        self.pendingReleaseTransitionResetWorkItem = nil
         self.targetScreen = nil
         self.removeMouseDownMonitors()
         trace.mark("cancelWorkAndMonitors")
@@ -516,6 +522,7 @@ final class BottomOverlayWindowController {
     }
 
     func beginReleaseTransition(duration: TimeInterval = 0.28) {
+        guard NotchContentState.shared.isBottomOverlayPresented, self.window?.alphaValue != 0 else { return }
         let now = Date()
         let deadline = now.addingTimeInterval(max(duration, 0.12))
         if let existingDeadline = self.releaseTransitionActiveUntil, existingDeadline > deadline {
@@ -563,6 +570,7 @@ final class BottomOverlayWindowController {
     }
 
     private func scheduleSizeAndPositionUpdate(after delay: TimeInterval = 0.08) {
+        guard NotchContentState.shared.isBottomOverlayPresented, self.window?.alphaValue != 0 else { return }
         if self.isReleaseTransitionActive {
             self.deferredResizePending = true
             return
@@ -577,6 +585,7 @@ final class BottomOverlayWindowController {
                 Self.overlayBench("bottom_resize_drop reason=stale_generation")
                 return
             }
+            self.pendingResizeWorkItem = nil
             self.updateSizeAndPosition()
         }
         self.pendingResizeWorkItem = resizeWorkItem
@@ -587,9 +596,7 @@ final class BottomOverlayWindowController {
     /// session geometry before the warm panel moves onscreen. Otherwise the
     /// panel can reveal its previous multiline frame until resize debounce.
     private func prepareFirstFrameForNewPresentation(trace: inout OverlayCloseTrace) {
-        guard let window,
-              let hostingView = window.contentView as? NSHostingView<BottomOverlayView>
-        else { return }
+        guard let window, let hostingView else { return }
 
         hostingView.rootView = BottomOverlayView()
         hostingView.invalidateIntrinsicContentSize()
@@ -597,8 +604,8 @@ final class BottomOverlayWindowController {
         trace.mark("layout1")
         let firstFrameSize = hostingView.fittingSize
         trace.mark("fittingSize")
-        hostingView.frame = NSRect(origin: .zero, size: firstFrameSize)
         window.setFrame(NSRect(origin: window.frame.origin, size: firstFrameSize), display: false)
+        hostingView.frame = NSRect(origin: .zero, size: firstFrameSize)
         trace.mark("setFrame")
         self.positionWindow()
         trace.mark("position")
@@ -609,6 +616,7 @@ final class BottomOverlayWindowController {
 
     /// Update window size based on current SwiftUI content and re-position
     private func updateSizeAndPosition() {
+        guard NotchContentState.shared.isBottomOverlayPresented, self.window?.alphaValue != 0 else { return }
         var trace = OverlayCloseTrace("bottom.layout")
         defer { trace.finish() }
         if self.isReleaseTransitionActive {
@@ -616,7 +624,7 @@ final class BottomOverlayWindowController {
             return
         }
 
-        guard let window = window, let hostingView = window.contentView as? NSHostingView<BottomOverlayView> else { return }
+        guard let window, let hostingView else { return }
 
         // Re-calculate fitting size for the new layout constants
         let newSize = hostingView.fittingSize
@@ -667,6 +675,7 @@ final class BottomOverlayWindowController {
 
         let contentView = BottomOverlayView()
         let hostingView = BottomOverlayHostingView(rootView: contentView)
+        hostingView.sizingOptions = .intrinsicContentSize
 
         // Let SwiftUI determine the size
         let fittingSize = hostingView.fittingSize
@@ -676,12 +685,20 @@ final class BottomOverlayWindowController {
         hostingView.wantsLayer = true
         hostingView.layer?.backgroundColor = .clear
 
+        // A hosting view used directly as window content can resize that window
+        // during SwiftUI updates even with sizingOptions disabled. Keep window
+        // sizing in this controller, including while its warm panel is hidden.
+        let container = BottomOverlayContainerView(frame: hostingView.frame)
+        container.wantsLayer = true
+        container.addSubview(hostingView)
+        hostingView.autoresizingMask = [.width, .height]
         panel.setContentSize(fittingSize)
-        panel.contentView = hostingView
+        panel.contentView = container
         hostingView.layoutSubtreeIfNeeded()
         hostingView.display()
 
         self.window = panel
+        self.hostingView = hostingView
     }
 
     private var isReleaseTransitionActive: Bool {
@@ -930,7 +947,10 @@ final class BottomOverlayPromptMenuController {
     }
 
     private func showMenuIfPossible() {
-        guard self.selectorFrameInScreen.width > 0, self.selectorFrameInScreen.height > 0 else { return }
+        guard NotchContentState.shared.isBottomOverlayPresented,
+              let parentWindow = self.parentWindow, parentWindow.isVisible, parentWindow.alphaValue > 0,
+              self.selectorFrameInScreen.width > 0, self.selectorFrameInScreen.height > 0
+        else { return }
 
         self.createWindowIfNeeded()
         self.updateMenuContent()
@@ -1207,7 +1227,10 @@ final class BottomOverlayModeMenuController {
     }
 
     private func showMenuIfPossible() {
-        guard self.selectorFrameInScreen.width > 0, self.selectorFrameInScreen.height > 0 else { return }
+        guard NotchContentState.shared.isBottomOverlayPresented,
+              let parentWindow = self.parentWindow, parentWindow.isVisible, parentWindow.alphaValue > 0,
+              self.selectorFrameInScreen.width > 0, self.selectorFrameInScreen.height > 0
+        else { return }
 
         self.createWindowIfNeeded()
         self.updateMenuContent()
@@ -1471,7 +1494,10 @@ final class BottomOverlayActionsMenuController {
     }
 
     private func showMenuIfPossible() {
-        guard self.selectorFrameInScreen.width > 0, self.selectorFrameInScreen.height > 0 else { return }
+        guard NotchContentState.shared.isBottomOverlayPresented,
+              let parentWindow = self.parentWindow, parentWindow.isVisible, parentWindow.alphaValue > 0,
+              self.selectorFrameInScreen.width > 0, self.selectorFrameInScreen.height > 0
+        else { return }
 
         self.createWindowIfNeeded()
         self.updateMenuContent()
@@ -2340,6 +2366,13 @@ private enum PillShadowMetrics {
     static var visibleWidth: CGFloat = 100
 }
 
+private final class BottomOverlayContainerView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let hit = super.hitTest(point)
+        return hit === self ? nil : hit
+    }
+}
+
 private final class BottomOverlayHostingView: NSHostingView<BottomOverlayView> {
     override func hitTest(_ point: NSPoint) -> NSView? {
         if SettingsStore.shared.overlaySize == .pill {
@@ -2886,11 +2919,14 @@ struct BottomOverlayView: View {
     /// Expands after a short dwell so a passing pointer never moves the pill, and
     /// collapses late so the trip from pill to menu does not close it.
     private func handlePillHover(_ hovering: Bool) {
-        guard self.isPillSize else { return }
+        guard self.isPillSize, self.contentState.isBottomOverlayPresented, !self.contentState.isBottomOverlayDismissing else { return }
         self.pillHoverWorkItem?.cancel()
+        self.pillHoverWorkItem = nil
         let shouldExpand = hovering && self.isPromptSelectableMode && !self.contentState.isProcessing
         guard shouldExpand != self.isPillExpanded else { return }
         let work = DispatchWorkItem {
+            self.pillHoverWorkItem = nil
+            guard self.contentState.isBottomOverlayPresented, !self.contentState.isBottomOverlayDismissing else { return }
             if !shouldExpand, BottomOverlayPromptMenuController.shared.isMenuVisible {
                 self.handlePillHover(false)
                 return
@@ -3293,7 +3329,7 @@ struct BottomOverlayView: View {
 
     private var targetAppIconView: some View {
         let appIcon = self.displayedAppIcon
-        let showModelLoading = self.layout.showsModeLabel && !self.appServices.asr.isAsrReady &&
+        let showModelLoading = self.contentState.isBottomOverlayPresented && self.layout.showsModeLabel && !self.appServices.asr.isAsrReady &&
             (self.appServices.asr.isLoadingModel || self.appServices.asr.isDownloadingModel)
         return VStack(spacing: 2) {
             if showModelLoading {
@@ -3720,6 +3756,7 @@ struct BottomOverlayView: View {
             self.rememberAppIcon(icon)
         }
         .onDisappear {
+            self.collapsePillImmediately()
             self.closePromptMenu()
             self.closeModeMenu()
             self.closeActionsMenu()
@@ -3727,6 +3764,12 @@ struct BottomOverlayView: View {
             self.isHoveringPromptChip = false
             self.isHoveringActionsChip = false
             self.isHoveringSettingsChip = false
+        }
+        .transaction { transaction in
+            if !self.contentState.isBottomOverlayPresented {
+                transaction.animation = nil
+                transaction.disablesAnimations = true
+            }
         }
         // TODO: Add tap-to-expand for command mode history (future enhancement)
         // .contentShape(Rectangle())

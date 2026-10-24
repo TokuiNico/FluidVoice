@@ -15,6 +15,7 @@ struct OverlayCaptionTests {
         self.testRetainedContextCorrectionWithUnchangedPreview()
         self.testWordRevealDeadlinesAndUnicode()
         try await self.testDisplayBufferDeadlinesAndCancellation()
+        try await self.testStoppedCaptionCannotRestartFromLayoutOrDetachment()
         self.testScrollingAndReducedMotion()
         self.testPreviewLimitKeepsAFullViewport()
         self.testTrimmingDoesNotRestartTheSameLineScroll()
@@ -188,6 +189,29 @@ struct OverlayCaptionTests {
         precondition(view.accessibilityValue() as? String == hiddenText)
         update("Reduce Motion presents the complete result immediately", reduceMotion: true)
         precondition(view.accessibilityValue() as? String == "Reduce Motion presents the complete result immediately")
+        precondition(view.layer?.sublayers?.allSatisfy { $0.animationKeys()?.isEmpty != false } == true)
+    }
+
+    @MainActor
+    static func testStoppedCaptionCannotRestartFromLayoutOrDetachment() async throws {
+        let view = OverlayCaptionNSView(frame: CGRect(x: 0, y: 0, width: 304, height: 54))
+        let window = NSWindow(contentRect: view.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = view
+        defer { window.contentView = nil; window.close() }
+        func update() {
+            view.update(caption: .tail("Words still waiting to appear must not animate after the preview has been removed.", limit: 100), fontSize: 13, opacity: 1, reduceMotion: false)
+        }
+        update()
+        view.stopScrolling()
+        view.layoutSubtreeIfNeeded()
+        precondition(view.layer?.sublayers?.allSatisfy { $0.animationKeys()?.isEmpty != false } == true, "A pending layout must not restart a stopped fade")
+        update()
+        window.contentView = nil
+        let removedValue = view.accessibilityValue() as? String
+        view.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(500))
+        precondition(view.accessibilityValue() as? String == removedValue, "Detached captions must cancel their pending word queue")
         precondition(view.layer?.sublayers?.allSatisfy { $0.animationKeys()?.isEmpty != false } == true)
     }
 

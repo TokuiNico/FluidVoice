@@ -273,7 +273,13 @@ final class OverlayCaptionNSView: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        if self.window == nil { self.stopScrolling() }
         self.updateBackingScale()
+    }
+
+    override func viewDidHide() {
+        super.viewDidHide()
+        self.stopScrolling()
     }
 
     override func viewDidChangeBackingProperties() {
@@ -292,7 +298,7 @@ final class OverlayCaptionNSView: NSView {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
     func update(caption: OverlayCaptionText, context: OverlayCaptionText? = nil, fontSize: CGFloat, opacity: CGFloat, reduceMotion: Bool, isActive: Bool = true) {
-        guard isActive else {
+        guard isActive, !self.isHiddenOrHasHiddenAncestor else {
             if self.latestUpdate != nil { self.stopScrolling() }
             return
         }
@@ -460,6 +466,8 @@ final class OverlayCaptionNSView: NSView {
     func stopScrolling() {
         self.cancelPendingCaption()
         self.latestUpdate = nil
+        self.canAnimate = false
+        self.revealFromOffset = nil
         self.layer?.removeAnimation(forKey: Self.scrollAnimationKey)
         self.revealLayer.removeAllAnimations()
     }
