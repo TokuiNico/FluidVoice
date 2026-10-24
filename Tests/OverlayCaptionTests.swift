@@ -16,6 +16,7 @@ struct OverlayCaptionTests {
         self.testWordRevealDeadlinesAndUnicode()
         try await self.testDisplayBufferDeadlinesAndCancellation()
         try await self.testStoppedCaptionCannotRestartFromLayoutOrDetachment()
+        try await self.testReopenedCaptionStartsAnewWithoutAnIntermediateEmptyUpdate()
         self.testScrollingAndReducedMotion()
         self.testPreviewLimitKeepsAFullViewport()
         self.testTrimmingDoesNotRestartTheSameLineScroll()
@@ -213,6 +214,27 @@ struct OverlayCaptionTests {
         try await Task.sleep(for: .milliseconds(500))
         precondition(view.accessibilityValue() as? String == removedValue, "Detached captions must cancel their pending word queue")
         precondition(view.layer?.sublayers?.allSatisfy { $0.animationKeys()?.isEmpty != false } == true)
+    }
+
+    @MainActor
+    static func testReopenedCaptionStartsAnewWithoutAnIntermediateEmptyUpdate() async throws {
+        let view = OverlayCaptionNSView(frame: CGRect(x: 0, y: 0, width: 304, height: 54))
+        func update(_ text: String, active: Bool = true) {
+            view.update(caption: .tail(text, limit: 100), context: .tail(text, limit: 800), fontSize: 13, opacity: 1, reduceMotion: false, isActive: active)
+        }
+        update(String(repeating: "Older words fill this preview. ", count: 10))
+        view.flushPendingCaption()
+        view.stopScrolling()
+        let hiddenValue = view.accessibilityValue() as? String
+        update("", active: false)
+        precondition(view.accessibilityValue() as? String == hiddenValue, "A hidden reset must not repaint the parked caption")
+        let next = "New recording words should begin gradually instead of appearing together in one block."
+        update(next)
+        let initial = view.accessibilityValue() as? String ?? ""
+        precondition(!initial.isEmpty && next.hasPrefix(initial) && initial != next, "A previous recording must not skip the new recording's word reveal")
+        try await Task.sleep(for: .milliseconds(500))
+        precondition(view.accessibilityValue() as? String == next)
+        view.stopScrolling()
     }
 
     @MainActor

@@ -14,6 +14,18 @@ final class OverlayCaptionPresentationTests: XCTestCase {
         }.joined(separator: "; ")
     }
 
+    private func waitForAnimationRemoval(_ layer: CALayer?, key: String) async throws {
+        let layer = try XCTUnwrap(layer)
+        let deadline = CACurrentMediaTime() + 1
+        // The presentation can finish before Core Animation retires its client-side
+        // animation record. Check the visual deadline separately, then drain commits.
+        while layer.animation(forKey: key) != nil, CACurrentMediaTime() < deadline {
+            CATransaction.flush()
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertNil(layer.animation(forKey: key), self.animationState(layer))
+    }
+
     private func visibilityState(_ view: NSView) -> String {
         "hidden=\(view.isHiddenOrHasHiddenAncestor), frame=\(view.frame), visible=\(view.window?.isVisible ?? false), alpha=\(view.window?.alphaValue ?? 0), " +
             "occlusion=\(view.window?.occlusionState.rawValue ?? 0), reduceMotion=\(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)"
@@ -152,16 +164,26 @@ final class OverlayCaptionPresentationTests: XCTestCase {
     func testProcessingShimmerStopsAcrossEveryBottomSize() async throws {
         let settings = SettingsStore.shared
         let state = NotchContentState.shared
+        let previousPosition = settings.overlayPosition
         let previousSize = settings.overlaySize
         let previousProcessing = state.isProcessing
         let controller = BottomOverlayWindowController.shared
-        defer { controller.hideImmediately(); settings.overlaySize = previousSize; state.isProcessing = previousProcessing }
+        let manager = NotchOverlayManager.shared
+        defer {
+            manager.hideImmediately()
+            settings.overlayPosition = previousPosition
+            settings.overlaySize = previousSize
+            state.isProcessing = previousProcessing
+        }
+        settings.overlayPosition = .bottom
         func shimmers(in view: NSView) -> [CompositorShimmerSweepView] {
             (view as? CompositorShimmerSweepView).map { [$0] } ?? view.subviews.flatMap { shimmers(in: $0) }
         }
         for size in [SettingsStore.OverlaySize.pill, .small, .medium, .large] {
             settings.overlaySize = size
-            controller.show(audioPublisher: Just(CGFloat.zero).eraseToAnyPublisher(), mode: .dictation)
+            // Use the recording entry point so a previous manager hide cannot
+            // clear this presentation after its transaction finishes.
+            manager.show(audioLevelPublisher: Just(CGFloat.zero).eraseToAnyPublisher(), mode: .dictation)
             controller.setProcessing(true)
             try await Task.sleep(for: .milliseconds(180))
             let host = try XCTUnwrap(controller.contentViewForTests)
@@ -174,14 +196,16 @@ final class OverlayCaptionPresentationTests: XCTestCase {
             let waitingViews = shimmers(in: host)
             XCTAssertFalse(waitingViews.isEmpty, "Exercise the real waiting view for \(size): \(self.visibilityState(host)), processing=\(state.isProcessing), muted=\(state.isDictationMuted)")
             let visibility = waitingViews.map { self.visibilityState($0) }.joined(separator: "; ")
-            XCTAssertTrue(waitingViews.contains { $0.layer?.sublayers?.first?.animation(forKey: "fluid.shimmer.locations") != nil }, "Visible processing must still shimmer for \(size): \(visibility), presented=\(state.isBottomOverlayPresented)")
+            let hasAnimation = waitingViews.contains { $0.layer?.sublayers?.first?.animation(forKey: "fluid.shimmer.locations") != nil }
+            XCTAssertEqual(hasAnimation, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion, "Processing must respect Reduce Motion for \(size): \(visibility)")
+            XCTAssertTrue(state.isProcessing, "A previous presentation must not clear this processing state")
             if let output = ProcessInfo.processInfo.environment["CAPTION_TEST_OUTPUT"] {
                 let bitmap = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
                 host.cacheDisplay(in: host.bounds, to: bitmap)
                 let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
                 try png.write(to: URL(fileURLWithPath: output).appendingPathComponent("processing-\(size.rawValue).png"))
             }
-            controller.hideImmediately()
+            manager.hideImmediately()
             try await Task.sleep(for: .milliseconds(300))
             XCTAssertFalse(state.isBottomOverlayPresented)
             XCTAssertTrue(waitingViews.allSatisfy { $0.layer?.sublayers?.first?.animationKeys()?.isEmpty != false }, "No waiting shimmer may survive dismissal for \(size)")
@@ -287,7 +311,8 @@ final class OverlayCaptionPresentationTests: XCTestCase {
         XCTAssertLessThan(intermediate.count, phrase.count)
         try await Task.sleep(for: .milliseconds(480))
         XCTAssertEqual(view.accessibilityValue() as? String, phrase)
-        XCTAssertTrue(fade.animationKeys()?.isEmpty ?? true, self.animationState(fade))
+        XCTAssertEqual(try XCTUnwrap(fade.presentation()).opacity, 1, accuracy: 0.01)
+        try await self.waitForAnimationRemoval(fade, key: "captionReveal")
         let bitmap = try XCTUnwrap(NSBitmapImageRep(
             bitmapDataPlanes: nil,
             pixelsWide: 304,
@@ -411,12 +436,12 @@ final class OverlayCaptionPresentationTests: XCTestCase {
         update(prefix + "\nNext word at a time")
         XCTAssertEqual(try XCTUnwrap(view.layer?.animation(forKey: "captionScroll")).beginTime, begin)
         try await Task.sleep(for: .milliseconds(160))
-        XCTAssertTrue(view.layer?.animationKeys()?.isEmpty ?? true, "Same-line words must not prolong scrolling: \(self.animationState(view.layer))")
         XCTAssertEqual(
             try XCTUnwrap(view.layer?.presentation()).sublayerTransform.m42,
             try XCTUnwrap(view.layer).sublayerTransform.m42,
             accuracy: 0.5
         )
+        try await self.waitForAnimationRemoval(view.layer, key: "captionScroll")
     }
 
     func testScrollInterpolatesThenStopsAndHonorsReduceMotion() async throws {
@@ -444,7 +469,7 @@ final class OverlayCaptionPresentationTests: XCTestCase {
         XCTAssertEqual(view.layer?.sublayerTransform.m42, target)
         try await Task.sleep(for: .milliseconds(300))
         XCTAssertEqual(try XCTUnwrap(view.layer?.presentation()).sublayerTransform.m42, target, accuracy: 0.5)
-        XCTAssertTrue(view.layer?.animationKeys()?.isEmpty ?? true, self.animationState(view.layer))
+        try await self.waitForAnimationRemoval(view.layer, key: "captionScroll")
         update("First line\nSecond line\nThird word\nFourth", reduceMotion: true)
         XCTAssertTrue(view.layer?.animationKeys()?.isEmpty ?? true, self.animationState(view.layer))
         view.frame.size.height = 16
@@ -529,7 +554,11 @@ final class OverlayCaptionPresentationTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(35))
         let host = try XCTUnwrap(controller.contentViewForTests)
         let view = try XCTUnwrap(caption(in: host))
-        XCTAssertNotEqual(view.accessibilityValue() as? String, state.cachedPreviewText, self.visibilityState(view))
+        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            XCTAssertEqual(view.accessibilityValue() as? String, state.cachedPreviewText, "Reduce Motion presents all words immediately")
+        } else {
+            XCTAssertNotEqual(view.accessibilityValue() as? String, state.cachedPreviewText, self.visibilityState(view))
+        }
         controller.hideImmediately()
         for _ in 0..<30 where state.isBottomOverlayPresented {
             try await Task.sleep(for: .milliseconds(10))
@@ -634,6 +663,10 @@ final class OverlayCaptionPresentationTests: XCTestCase {
             .background(Color(white: 0.12))
             .appTheme(.dark))
             window.contentView = host
+            window.orderFrontRegardless()
+            host.layoutSubtreeIfNeeded()
+            window.displayIfNeeded()
+            CATransaction.flush()
             if review { window.center(); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true) }
             for index in stride(from: 0, to: words.count, by: review ? 3 : 1) {
                 let latest = words[...min(index + (review ? 2 : 0), words.count - 1)].joined(separator: " ")

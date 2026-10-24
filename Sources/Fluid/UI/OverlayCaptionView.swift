@@ -215,7 +215,7 @@ struct OverlayCaptionView: NSViewRepresentable {
         guard let width = proposal.width, width.isFinite, width > 0 else { return nil }
         // Reserve complete line slots from the first word. Text updates must not resize
         // the window or move the controls underneath the preview.
-        return CGSize(width: width, height: nsView.fittingHeight(width: width, maxHeight: self.maxHeight, maxLines: self.maxLines))
+        return CGSize(width: width, height: OverlayCaptionLayout.viewportHeight(fontSize: self.fontSize, maxHeight: self.maxHeight, maxLines: self.maxLines))
     }
 
     static func dismantleNSView(_ nsView: OverlayCaptionNSView, coordinator: ()) {
@@ -371,7 +371,8 @@ final class OverlayCaptionNSView: NSView {
         if resetLayout || resetMotion { self.canAnimate = false }
         self.cachedLayout = nil
         self.pendingUpdate = true
-        self.invalidateIntrinsicContentSize()
+        // The fixed viewport has no intrinsic size. Invalidating it during a
+        // representable update asks SwiftUI to re-enter sizing unnecessarily.
         self.needsLayout = true
     }
 
@@ -466,6 +467,7 @@ final class OverlayCaptionNSView: NSView {
     func stopScrolling() {
         self.cancelPendingCaption()
         self.latestUpdate = nil
+        self.reveal = OverlayCaptionReveal()
         self.canAnimate = false
         self.revealFromOffset = nil
         self.layer?.removeAnimation(forKey: Self.scrollAnimationKey)
